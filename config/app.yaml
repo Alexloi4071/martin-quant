@@ -1,0 +1,8 @@
+app_name: martin-quant
+environment: research
+default_market: us_equities
+primary_timeframe: 15m
+context_timeframes:
+  - 1h
+  - 1d
+manual_review_required: true

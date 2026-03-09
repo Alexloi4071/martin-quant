@@ -1,0 +1,8 @@
+risk:
+  per_trade_risk_pct: 0.5
+  preferred_stop_pct_min: 1.5
+  preferred_stop_pct_max: 2.5
+  hard_skip_stop_pct: 5.0
+  partial_take_profit_r:
+    - 3
+    - 5

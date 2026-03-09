@@ -1,0 +1,12 @@
+setups:
+  primary: pullback
+  secondary: breakout
+  enable_parabolic_short: false
+  ema_windows:
+    - 9
+    - 21
+    - 50
+    - 150
+  timing_timeframe: 15m
+  context_timeframe: 1h
+  structure_timeframe: 1d

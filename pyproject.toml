@@ -1,0 +1,9 @@
+[project]
+name = "martin-quant"
+version = "0.1.0"
+description = "Standalone quantitative research framework for Martin-style stock selection and timing"
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

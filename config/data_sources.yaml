@@ -1,0 +1,10 @@
+providers:
+  finviz:
+    enabled: true
+    role: universe_scan
+  finnhub:
+    enabled: true
+    role: news_earnings_market_data
+  ibkr:
+    enabled: false
+    role: future_execution_extension
