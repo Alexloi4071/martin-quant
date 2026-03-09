@@ -2,3 +2,5 @@ pandas
 numpy
 pyyaml
 python-dotenv
+lxml>=5.0,<6.0
+pyarrow

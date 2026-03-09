@@ -1,0 +1,246 @@
+# config/research.yaml
+# Martin Quant - full project config
+# Sections: project, data, providers, universe, setups, timing, risk, backtest, runtime
+
+project:
+  name: martin-quant
+  mode: research
+  description: "US equities universe selection + setup + timing + risk + review + backtest"
+
+data:
+  provider:
+    type: local_parquet
+    params:
+      data_root: data/us_equities
+  timeframes:
+    - 1d
+    - 1h
+    - 15m
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROVIDERS
+# Finviz = candidate generator only. Martin does all real strategy judgement.
+# ─────────────────────────────────────────────────────────────────────────────
+providers:
+  finviz:
+    enabled: true
+    pause_seconds: 0.8
+    timeout: 20
+    max_symbols_total: 150
+    per_screen_cap: 40
+
+    # 4 screens with different roles:
+    # core_leaders    -> large/mid cap, confirmed trend, strong 6M perf
+    # growth_momentum -> EPS+sales growth, in uptrend
+    # pullback_candidates -> trend intact but near-term dip (potential entry zones)
+    # breakout_candidates -> high rel-vol, near 52w high, potential breakout
+    screens:
+      - name: core_leaders
+        enabled: true
+        limit: 120
+        order: -perfhalf
+        signal: ""
+        filters:
+          - geo_usa
+          - sh_price_o10
+          - cap_midover
+          - sh_avgvol_o500
+          - ta_sma50_pa
+          - ta_sma200_pa
+
+      - name: growth_momentum
+        enabled: true
+        limit: 120
+        order: -perfquarter
+        signal: ""
+        filters:
+          - geo_usa
+          - sh_price_o10
+          - cap_smallover
+          - sh_avgvol_o500
+          - fa_salesqoq_o15
+          - fa_epsqoq_o20
+          - fa_roe_o15
+          - ta_sma50_pa
+
+      - name: pullback_candidates
+        enabled: true
+        limit: 120
+        order: -perfmonth
+        signal: ""
+        filters:
+          - geo_usa
+          - sh_price_o10
+          - cap_smallover
+          - sh_avgvol_o500
+          - ta_sma50_pa
+          - ta_sma200_pa
+          - ta_perf_4wdown
+
+      - name: breakout_candidates
+        enabled: true
+        limit: 120
+        order: -relativevolume
+        signal: top_gainers
+        filters:
+          - geo_usa
+          - sh_price_o10
+          - cap_smallover
+          - sh_avgvol_o500
+          - ta_sma50_pa
+          - ta_highlow52w_a10h
+
+  finnhub:
+    enabled: true
+    api_key: ""                    # leave blank; set FINNHUB_API_KEY in env
+    api_key_env: FINNHUB_API_KEY
+    pause_seconds: 0.35
+    timeout: 20
+
+    metadata:
+      enabled: true
+
+    earnings:
+      enabled: true
+      lookahead_days: 45
+
+    ohlcv:
+      enabled: true
+      daily_days: 450
+      hourly_days: 120
+      m15_days: 45
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UNIVERSE BUILDER
+# Second-pass filter after Finviz candidate pool.
+# ─────────────────────────────────────────────────────────────────────────────
+universe:
+  benchmark_symbol: SPY
+  max_size: 30
+  max_per_sector: 6
+  min_days_to_earnings: 3
+  prefer_active_themes: true
+
+  liquidity:
+    min_price: 5.0
+    min_avg_volume_20d: 300000
+    min_avg_dollar_volume_20d: 10000000
+    min_adr_pct: 3.0
+
+  rs:
+    rs_lookback_days: 60
+    min_rs_rank_pct: 60.0
+
+  themes:
+    active_themes:
+      - ai
+      - semiconductors
+      - software
+      - cloud
+      - cyber_security
+      - crypto_equity
+      - biotech
+      - robotics
+      - energy_transition
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SETUPS
+# ─────────────────────────────────────────────────────────────────────────────
+setups:
+  pullback:
+    enabled: true
+    lookback_high_days: 20
+    min_pullback_depth_pct: 5.0
+    max_pullback_depth_pct: 30.0
+    max_support_distance_pct: 2.0
+    min_history_days: 60
+    require_close_above_ema50: true
+    require_ema_stack: true
+    first_pullback_lookback: 30
+
+  breakout:
+    enabled: true
+    lookback_high_days: 20
+    min_base_days: 3
+    max_base_days: 40
+    min_rvol_on_breakout: 1.5
+    tightness_atr_multiplier: 0.5
+    min_close_above_breakout_pct: 0.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TIMING  (intraday triggers on 15m / 1h)
+# ─────────────────────────────────────────────────────────────────────────────
+timing:
+  reclaim:
+    enabled: true
+    max_entry_bars: 6
+    min_trigger_rvol: 1.5
+    max_stop_distance_pct: 5.0
+    require_close_above_ema9_15m: true
+    require_context_1h_ok: true
+
+  orb:
+    enabled: true
+    max_entry_bars: 6
+    min_trigger_rvol: 1.5
+    max_stop_distance_pct: 5.0
+    require_close_above_orh: true
+    prefer_close_above_prior_day_high: false
+    require_context_1h_ok: true
+
+  avwap_reclaim:
+    enabled: true
+    max_entry_bars: 12
+    min_trigger_rvol: 1.2
+    max_stop_distance_pct: 5.0
+    avwap_touch_tolerance_pct: 0.5
+    max_avwap_extension_pct: 3.0
+    require_context_1h_ok: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RISK
+# ─────────────────────────────────────────────────────────────────────────────
+risk:
+  position_sizing:
+    per_trade_risk_pct: 0.5
+    max_position_pct: 30.0
+    max_position_small_cap_pct: 20.0
+    small_cap_threshold_mcap: 2000000000
+
+  portfolio_limits:
+    max_open_trades: 10
+    max_sector_concentration_pct: 40.0
+    max_gross_exposure_pct: 280.0
+
+  partial_take_profit:
+    partial_levels:
+      - [3.0, 40.0]   # take 40% at +3R
+      - [5.0, 30.0]   # take 30% at +5R
+
+  trailing_exit:
+    trail_mode: ema9
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKTEST
+# ─────────────────────────────────────────────────────────────────────────────
+backtest:
+  enabled: true
+  max_holding_days: 20
+  trail_mode: ema9
+
+  walkforward:
+    enabled: true
+    train_months: 6
+    test_months: 1
+    step_months: 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUNTIME
+# ─────────────────────────────────────────────────────────────────────────────
+runtime:
+  account_equity: 100000
+  output_dir: outputs/research_runs
+  max_review_cases: 10
+  universe_file: config/universe/auto_candidates.txt
+  review_root: outputs/review_cases
+  fail_on_missing_benchmark: true
