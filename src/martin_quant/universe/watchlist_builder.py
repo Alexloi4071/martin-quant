@@ -1,257 +1,330 @@
+"""watchlist_builder.py  (v2 — Martin Luk corrected filters)
+
+Key fixes in this version:
+  1. ADR >= 5.0% HARD FILTER  (Martin: only fast-moving stocks)
+  2. Dollar Volume filter       (price × avg_volume, not raw volume)
+  3. Stock category tagging    (Leading / Mediocre / Lagging / Pillar)
+  4. 150 EMA trend filter      (price > ema_150 for long candidates)
+
+Martin's universe criteria (financialwisdomtv interview 2026-02):
+  - ADR% > 5%        : only volatile / fast-moving stocks
+  - Dollar Vol > $10M/day : sufficient liquidity
+  - RS rank > 70     : outperforming 70% of the market
+  - Price > $10      : avoid penny stocks
+  - Close > EMA 150  : long-term uptrend filter for longs
+
+Category definitions:
+  Leading  : RS rank >= 80  (top 20%)
+  Mediocre : RS rank 50-79
+  Lagging  : RS rank < 50
+  Pillar   : market_cap >= $100B (mega-cap anchor positions)
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import Optional
 
+import numpy as np
 import pandas as pd
 
-from martin_quant.features.atr import compute_adr, compute_atr
-from martin_quant.features.ema import compute_ema
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WatchlistConfig:
+    # Price filters
+    min_price: float = 10.0
+    max_price: float = 2000.0
+
+    # ADR% (Average Daily Range) — Martin HARD minimum
+    min_adr_pct: float = 5.0           # MUST be >= 5% per Martin Luk
+    adr_lookback: int = 20
+
+    # Dollar Volume (price × volume) — NOT raw share volume
+    min_dollar_volume_20d: float = 10_000_000.0   # $10M/day minimum
+    dollar_vol_lookback: int = 20
+
+    # Relative Strength
+    min_rs_rank_pct: float = 70.0      # RS rank percentile (0-100)
+    rs_lookback_days: int = 252        # 1-year RS calculation window
+
+    # Category thresholds
+    leading_rs_min: float = 80.0       # RS >= 80 = Leading
+    mediocre_rs_min: float = 50.0      # RS 50-79 = Mediocre
+    pillar_mcap_min: float = 100_000_000_000.0  # $100B+ = Pillar
+
+    # EMA trend
+    require_above_ema150: bool = True   # close > EMA150 for long candidates
+
+    # Market cap
+    min_market_cap: float = 500_000_000.0   # $500M minimum
 
 
-@dataclass(slots=True)
-class UniverseConfig:
-    # Liquidity filters
-    min_price: float = 5.0
-    min_avg_volume_20d: int = 300_000
-    min_avg_dollar_volume_20d: float = 10_000_000.0
-    min_adr_pct: float = 3.0
-
-    # RS / Relative Strength
-    rs_lookback_days: int = 60
-    min_rs_rank_pct: float = 60.0
-    benchmark_symbol: str = "SPY"
-
-    # Portfolio construction
-    max_size: int = 30
-    max_per_sector: int = 6
-    min_days_to_earnings: int = 3
-
-    # Earnings
-    earnings_path: str = ""
-
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 @dataclass
 class WatchlistEntry:
     symbol: str
     price: float
-    avg_volume_20d: float
-    avg_dollar_volume_20d: float
     adr_pct: float
-    rs_raw: float
+    avg_dollar_volume_20d: float
     rs_rank_pct: float
-    sector: str = ""
-    theme: str = ""
-    days_to_earnings: int = 999
-    metadata: dict[str, Any] = field(default_factory=dict)
+    rs_1yr_pct: float
+    above_ema150: bool
+    market_cap: Optional[float]
+    sector: str
+    theme: str
+    category: str       # "leading" | "mediocre" | "lagging" | "pillar"
+    volume_rank: float  # 0-100 percentile
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict:
         return {
-            "symbol": self.symbol,
-            "price": self.price,
-            "avg_volume_20d": self.avg_volume_20d,
-            "avg_dollar_volume_20d": self.avg_dollar_volume_20d,
-            "adr_pct": self.adr_pct,
-            "rs_raw": self.rs_raw,
-            "rs_rank_pct": self.rs_rank_pct,
-            "sector": self.sector,
-            "theme": self.theme,
-            "days_to_earnings": self.days_to_earnings,
-            **self.metadata,
+            "symbol":              self.symbol,
+            "price":               round(self.price, 2),
+            "adr_pct":             round(self.adr_pct, 2),
+            "avg_dollar_volume_20d": round(self.avg_dollar_volume_20d, 0),
+            "rs_rank_pct":         round(self.rs_rank_pct, 1),
+            "rs_1yr_pct":          round(self.rs_1yr_pct, 2),
+            "above_ema150":        self.above_ema150,
+            "market_cap":          self.market_cap,
+            "sector":              self.sector,
+            "theme":               self.theme,
+            "category":            self.category,
+            "volume_rank":         round(self.volume_rank, 1),
         }
 
 
+# ---------------------------------------------------------------------------
+# Core functions
+# ---------------------------------------------------------------------------
+
+def compute_adr_pct(df: pd.DataFrame, lookback: int = 20) -> float:
+    """
+    Average Daily Range% = mean((high - low) / low * 100) over last N bars.
+    This is the PRIMARY fast-stock filter for Martin Luk strategy.
+    """
+    recent = df.tail(lookback)
+    adr = ((recent["high"] - recent["low"]) / recent["low"] * 100).mean()
+    return float(adr)
+
+
+def compute_dollar_volume(df: pd.DataFrame, lookback: int = 20) -> float:
+    """
+    Average daily dollar volume = mean(close * volume) over last N bars.
+    Martin uses DOLLAR volume (not share volume) for liquidity screening.
+    Minimum threshold: $10M/day.
+    """
+    recent = df.tail(lookback)
+    dollar_vol = (recent["close"] * recent["volume"]).mean()
+    return float(dollar_vol)
+
+
+def compute_rs_vs_benchmark(
+    df: pd.DataFrame,
+    benchmark_df: pd.DataFrame,
+    lookback_days: int = 252,
+) -> float:
+    """
+    Relative Strength = stock 1-year return / SPY 1-year return.
+    Returns the RS ratio (> 1.0 = outperforming SPY).
+    """
+    stock_ret = (
+        df["close"].iloc[-1] / df["close"].iloc[-min(lookback_days, len(df))] - 1
+    )
+    bench_ret = (
+        benchmark_df["close"].iloc[-1]
+        / benchmark_df["close"].iloc[-min(lookback_days, len(benchmark_df))] - 1
+    )
+    if bench_ret == 0:
+        return 0.0
+    return float(stock_ret / abs(bench_ret))
+
+
+def compute_ema150(df: pd.DataFrame) -> Optional[float]:
+    """Compute the latest 150-day EMA value."""
+    if len(df) < 150:
+        return None
+    ema = df["close"].ewm(span=150, adjust=False, min_periods=150).mean()
+    return float(ema.iloc[-1])
+
+
+def classify_category(
+    rs_rank_pct: float,
+    market_cap: Optional[float],
+    cfg: WatchlistConfig,
+) -> str:
+    """
+    Martin's four-category classification:
+      Pillar   = mega-cap ($100B+), low ADR but stable anchors
+      Leading  = RS >= 80, fast-moving leaders
+      Mediocre = RS 50-79, middle of the pack
+      Lagging  = RS < 50, avoid or short candidates
+    """
+    if market_cap and market_cap >= cfg.pillar_mcap_min:
+        return "pillar"
+    if rs_rank_pct >= cfg.leading_rs_min:
+        return "leading"
+    if rs_rank_pct >= cfg.mediocre_rs_min:
+        return "mediocre"
+    return "lagging"
+
+
+# ---------------------------------------------------------------------------
+# Main builder
+# ---------------------------------------------------------------------------
+
 class WatchlistBuilder:
     """
-    Second-pass universe filter.
+    Builds a filtered, ranked watchlist from a universe of OHLCV data.
 
-    Input:
-      - candidate_symbols: list from Finviz screens
-      - ohlcv_map: dict[symbol -> daily DataFrame with open/high/low/close/volume]
-      - metadata_df: DataFrame with symbol, sector, theme columns
-      - earnings_df: DataFrame with symbol, earnings_date columns (optional)
-
-    Output:
-      - list[WatchlistEntry] sorted by rs_rank_pct descending
-      - DataFrame version for easy CSV/parquet export
+    Usage:
+        builder = WatchlistBuilder(config)
+        entries = builder.build(
+            symbols=symbols,
+            ohlcv_map=ohlcv_map,
+            spy_df=spy_df,
+            metadata=meta_dict,   # {symbol: {sector, theme, market_cap}}
+        )
+        df = pd.DataFrame([e.to_dict() for e in entries])
     """
 
-    def __init__(self, config: UniverseConfig | None = None) -> None:
-        self.config = config or UniverseConfig()
+    def __init__(self, config: Optional[WatchlistConfig] = None) -> None:
+        self.config = config or WatchlistConfig()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def _passes_filters(self, df: pd.DataFrame) -> tuple[bool, float, float, Optional[float]]:
+        """
+        Returns (passes, adr_pct, dollar_vol, ema150)
+        Applies all hard filters.
+        """
+        cfg = self.config
+
+        if len(df) < 30:
+            return False, 0.0, 0.0, None
+
+        last_close = float(df["close"].iloc[-1])
+
+        # Price filter
+        if not (cfg.min_price <= last_close <= cfg.max_price):
+            return False, 0.0, 0.0, None
+
+        # ADR filter (HARD — Martin requires > 5%)
+        adr = compute_adr_pct(df, cfg.adr_lookback)
+        if adr < cfg.min_adr_pct:
+            return False, adr, 0.0, None
+
+        # Dollar Volume filter
+        dvol = compute_dollar_volume(df, cfg.dollar_vol_lookback)
+        if dvol < cfg.min_dollar_volume_20d:
+            return False, adr, dvol, None
+
+        # EMA 150 filter
+        ema150 = compute_ema150(df)
+        if cfg.require_above_ema150 and ema150 is not None:
+            if last_close < ema150:
+                return False, adr, dvol, ema150
+
+        return True, adr, dvol, ema150
 
     def build(
         self,
-        candidate_symbols: list[str],
+        symbols: list[str],
         ohlcv_map: dict[str, pd.DataFrame],
-        metadata_df: pd.DataFrame | None = None,
-        earnings_df: pd.DataFrame | None = None,
+        spy_df: Optional[pd.DataFrame] = None,
+        metadata: Optional[dict[str, dict]] = None,
     ) -> list[WatchlistEntry]:
-        cfg = self.config
-        metadata_df = self._prep_metadata(metadata_df)
-        earnings_map = self._build_earnings_map(earnings_df)
-        benchmark_rs = self._compute_benchmark_return(ohlcv_map)
+        """
+        Build and rank the watchlist.
 
+        Parameters
+        ----------
+        symbols : list[str]
+        ohlcv_map : dict  {symbol: daily_ohlcv_df}
+        spy_df : pd.DataFrame, optional
+            SPY daily OHLCV for RS calculation.
+        metadata : dict, optional
+            {symbol: {"sector": str, "theme": str, "market_cap": float}}
+
+        Returns
+        -------
+        list[WatchlistEntry] sorted by RS rank desc.
+        """
+        cfg  = self.config
+        meta = metadata or {}
+
+        # Step 1: compute RS for all symbols
+        rs_map: dict[str, float] = {}
+        for sym in symbols:
+            df = ohlcv_map.get(sym)
+            if df is None or len(df) < 20:
+                continue
+            if spy_df is not None:
+                rs_map[sym] = compute_rs_vs_benchmark(df, spy_df, cfg.rs_lookback_days)
+            else:
+                # Fallback: use 1-year return as proxy
+                lookback = min(252, len(df))
+                rs_map[sym] = float(df["close"].iloc[-1] / df["close"].iloc[-lookback] - 1)
+
+        # Step 2: compute RS rank percentile across universe
+        if rs_map:
+            rs_values = np.array(list(rs_map.values()))
+            rs_ranks = {sym: float(np.mean(rs_values <= v) * 100)
+                        for sym, v in rs_map.items()}
+        else:
+            rs_ranks = {sym: 0.0 for sym in symbols}
+
+        # Step 3: compute volume rank percentile
+        dvol_map: dict[str, float] = {}
+        for sym in symbols:
+            df = ohlcv_map.get(sym)
+            if df is not None and len(df) >= 20:
+                dvol_map[sym] = compute_dollar_volume(df, cfg.dollar_vol_lookback)
+        if dvol_map:
+            dv_values = np.array(list(dvol_map.values()))
+            vol_ranks = {sym: float(np.mean(dv_values <= v) * 100)
+                         for sym, v in dvol_map.items()}
+        else:
+            vol_ranks = {sym: 0.0 for sym in symbols}
+
+        # Step 4: apply filters + build entries
         entries: list[WatchlistEntry] = []
-
-        for symbol in candidate_symbols:
-            symbol = symbol.upper()
-            if symbol == cfg.benchmark_symbol.upper():
+        for sym in symbols:
+            df = ohlcv_map.get(sym)
+            if df is None:
                 continue
 
-            df = ohlcv_map.get(symbol)
-            if df is None or df.empty or len(df) < max(cfg.rs_lookback_days, 20):
+            rs_rank = rs_ranks.get(sym, 0.0)
+            if rs_rank < cfg.min_rs_rank_pct:
                 continue
 
-            df = df.copy().sort_values("timestamp").reset_index(drop=True)
-            price = float(df["close"].iloc[-1])
-            if price < cfg.min_price:
+            passes, adr, dvol, ema150 = self._passes_filters(df)
+            if not passes:
                 continue
 
-            avg_vol = float(df["volume"].tail(20).mean())
-            if avg_vol < cfg.min_avg_volume_20d:
-                continue
+            sym_meta    = meta.get(sym.upper(), {})
+            last_close  = float(df["close"].iloc[-1])
+            market_cap  = sym_meta.get("market_cap")
+            above_ema150 = (ema150 is not None) and (last_close > ema150)
 
-            avg_dollar_vol = float((df["close"] * df["volume"]).tail(20).mean())
-            if avg_dollar_vol < cfg.min_avg_dollar_volume_20d:
-                continue
-
-            adr = compute_adr(df, period=20)
-            adr_pct_val = float(adr.iloc[-1] / price * 100) if not adr.isna().all() else 0.0
-            if adr_pct_val < cfg.min_adr_pct:
-                continue
-
-            rs_raw = self._compute_rs(df, lookback=cfg.rs_lookback_days, benchmark_return=benchmark_rs)
-
-            days_to_earn = earnings_map.get(symbol, 999)
-            if days_to_earn < cfg.min_days_to_earnings:
-                continue
-
-            meta_row = metadata_df[metadata_df["symbol"] == symbol]
-            sector = str(meta_row["sector"].iloc[0]) if not meta_row.empty and "sector" in meta_row.columns else ""
-            theme  = str(meta_row["theme"].iloc[0])  if not meta_row.empty and "theme"  in meta_row.columns else ""
+            rs_1yr = rs_map.get(sym, 0.0) * 100  # convert to pct
 
             entries.append(WatchlistEntry(
-                symbol=symbol,
-                price=price,
-                avg_volume_20d=avg_vol,
-                avg_dollar_volume_20d=avg_dollar_vol,
-                adr_pct=round(adr_pct_val, 2),
-                rs_raw=round(rs_raw, 4),
-                rs_rank_pct=0.0,
-                sector=sector,
-                theme=theme,
-                days_to_earnings=days_to_earn,
+                symbol=sym.upper(),
+                price=last_close,
+                adr_pct=adr,
+                avg_dollar_volume_20d=dvol,
+                rs_rank_pct=rs_rank,
+                rs_1yr_pct=rs_1yr,
+                above_ema150=above_ema150,
+                market_cap=market_cap,
+                sector=sym_meta.get("sector", "Unknown"),
+                theme=sym_meta.get("theme", ""),
+                category=classify_category(rs_rank, market_cap, cfg),
+                volume_rank=vol_ranks.get(sym, 0.0),
             ))
 
-        entries = self._apply_rs_ranks(entries)
-        entries = [e for e in entries if e.rs_rank_pct >= cfg.min_rs_rank_pct]
-        entries = self._cap_per_sector(entries)
-        entries = entries[: cfg.max_size]
-
-        return entries
-
-    def to_dataframe(self, entries: list[WatchlistEntry]) -> pd.DataFrame:
-        if not entries:
-            return pd.DataFrame()
-        return pd.DataFrame([e.to_dict() for e in entries])
-
-    def save(
-        self,
-        entries: list[WatchlistEntry],
-        output_dir: str | Path,
-        universe_txt: str | Path | None = None,
-    ) -> None:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        df = self.to_dataframe(entries)
-        if not df.empty:
-            df.to_csv(output_dir / "watchlist.csv", index=False)
-            df.to_parquet(output_dir / "watchlist.parquet", index=False)
-
-        if universe_txt is not None:
-            Path(universe_txt).parent.mkdir(parents=True, exist_ok=True)
-            symbols = [e.symbol for e in entries]
-            Path(universe_txt).write_text("\n".join(symbols) + "\n", encoding="utf-8")
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _prep_metadata(metadata_df: pd.DataFrame | None) -> pd.DataFrame:
-        if metadata_df is None or metadata_df.empty:
-            return pd.DataFrame(columns=["symbol", "sector", "theme"])
-        out = metadata_df.copy()
-        if "symbol" in out.columns:
-            out["symbol"] = out["symbol"].astype(str).str.upper()
-        return out
-
-    @staticmethod
-    def _build_earnings_map(
-        earnings_df: pd.DataFrame | None,
-    ) -> dict[str, int]:
-        if earnings_df is None or earnings_df.empty:
-            return {}
-        today = pd.Timestamp.utcnow().normalize()
-        out: dict[str, int] = {}
-        for _, row in earnings_df.iterrows():
-            symbol = str(row.get("symbol", "")).upper()
-            edate = pd.to_datetime(row.get("earnings_date"), utc=True, errors="coerce")
-            if pd.isna(edate) or not symbol:
-                continue
-            days = (edate.normalize() - today).days
-            if symbol not in out or days < out[symbol]:
-                out[symbol] = max(0, int(days))
-        return out
-
-    def _compute_benchmark_return(self, ohlcv_map: dict[str, pd.DataFrame]) -> float:
-        bm = self.config.benchmark_symbol.upper()
-        df = ohlcv_map.get(bm)
-        if df is None or df.empty or len(df) < self.config.rs_lookback_days:
-            return 0.0
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        start = float(df["close"].iloc[-self.config.rs_lookback_days])
-        end = float(df["close"].iloc[-1])
-        return (end - start) / start if start != 0 else 0.0
-
-    def _compute_rs(
-        self,
-        df: pd.DataFrame,
-        lookback: int,
-        benchmark_return: float,
-    ) -> float:
-        if len(df) < lookback:
-            return 0.0
-        start = float(df["close"].iloc[-lookback])
-        end = float(df["close"].iloc[-1])
-        stock_return = (end - start) / start if start != 0 else 0.0
-        return stock_return - benchmark_return
-
-    @staticmethod
-    def _apply_rs_ranks(entries: list[WatchlistEntry]) -> list[WatchlistEntry]:
-        if not entries:
-            return entries
-        rs_values = [e.rs_raw for e in entries]
-        rs_series = pd.Series(rs_values)
-        ranks = rs_series.rank(pct=True) * 100.0
-        for entry, rank in zip(entries, ranks):
-            entry.rs_rank_pct = round(float(rank), 1)
+        # Sort by RS rank desc (Leading stocks first)
         return sorted(entries, key=lambda e: e.rs_rank_pct, reverse=True)
-
-    def _cap_per_sector(self, entries: list[WatchlistEntry]) -> list[WatchlistEntry]:
-        cap = self.config.max_per_sector
-        sector_counts: dict[str, int] = {}
-        result: list[WatchlistEntry] = []
-        for e in entries:
-            sector = e.sector or "Unknown"
-            count = sector_counts.get(sector, 0)
-            if count < cap:
-                result.append(e)
-                sector_counts[sector] = count + 1
-        return result
