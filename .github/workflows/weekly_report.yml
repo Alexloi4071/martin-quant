@@ -1,0 +1,43 @@
+name: Weekly Report
+
+on:
+  schedule:
+    # 每週日東部時間 Sunday 21:00 (UTC+8) = Sunday 13:00 UTC
+    - cron: "0 13 * * 0"
+  workflow_dispatch:   # 手動觸發
+
+jobs:
+  weekly-report:
+    name: Generate & Send Weekly Report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          pip install -e .
+
+      - name: Download trades.csv from artifact (if exists)
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: trades-csv
+          path: .
+
+      - name: Send Weekly Report
+        run: |
+          martin-scan report --weeks 1 --telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Upload report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-report
+          path: reports/
+          retention-days: 30
