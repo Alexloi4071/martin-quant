@@ -1,213 +1,192 @@
 """weekly_report.py
 
-Weekly Performance Report
-=========================
-Martin Luk 策略—自動產生週報:
-  - 勝/輸統計
-  - 平均 R 倍數
-  - 最佳/最差交易
-  - Setup 类型分析
-  - 板塊/主題表現
-  - 出場型態分析
+Weekly Report Generator
+========================
+從 TradeReviewer 結果生成完整週報，支援：
+  - 純文字 (print)
+  - Markdown 文件
+  - Telegram 訊息（via alert_manager）
 
 Usage:
     from martin_quant.review.weekly_report import WeeklyReport
-    report = WeeklyReport(trades_file="trades.csv")
-    report.print_report(weeks=4)
-    path = report.save_report(weeks=4)
+
+    report = WeeklyReport(csv_path="trades.csv")
+    report.generate()          # 本週，印到 stdout
+    report.generate(weeks=4)   # 近4週
+    report.save_markdown()     # 存成 weekly_report_YYYY-MM-DD.md
+    report.send_telegram()     # 傳送到 Telegram
 """
 from __future__ import annotations
 
-import csv
-import datetime
-import logging
-from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+import logging
+
+from martin_quant.review.trade_reviewer import TradeReviewer, ReviewResult
 
 log = logging.getLogger(__name__)
 
 
 class WeeklyReport:
     """
-    從 trades.csv 讀取交易展示週報。
+    週報生成器。
 
     Parameters
     ----------
-    trades_file : str
-        CSV 路徑
+    csv_path : str
+        trades.csv 路徑
+    output_dir : str
+        週報 Markdown 輸出目錄，預設 'reports/'
     """
 
-    def __init__(self, trades_file: str = "trades.csv") -> None:
-        self.trades_file = trades_file
+    def __init__(
+        self,
+        csv_path: str = "trades.csv",
+        output_dir: str = "reports",
+    ) -> None:
+        self.reviewer   = TradeReviewer(csv_path=csv_path)
+        self.output_dir = Path(output_dir)
+        self._result: Optional[ReviewResult] = None
 
-    # ------------------------------------------------------------------
-    # Public
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------------
 
-    def print_report(self, weeks: int = 4) -> None:
-        """Print formatted report to stdout"""
-        report = self._build(weeks)
-        print(report)
+    def generate(
+        self,
+        weeks: int = 1,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        print_report: bool = True,
+    ) -> ReviewResult:
+        """產生週報並（可選）印到 stdout"""
+        self.reviewer.load()
+        self._result = self.reviewer.review(
+            weeks=weeks,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if print_report:
+            print(self._result.summary())
+        return self._result
 
-    def save_report(self, weeks: int = 4) -> str:
-        """Save report to markdown file, return path"""
-        report = self._build(weeks)
-        today = datetime.date.today()
-        path  = f"review_{today}.md"
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(report)
-        log.info("Report saved: %s", path)
-        return path
+    def save_markdown(
+        self,
+        weeks: int = 1,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Path:
+        """生成週報並存成 Markdown 文件，回傳路徑"""
+        result = self.generate(
+            weeks=weeks,
+            start_date=start_date,
+            end_date=end_date,
+            print_report=False,
+        )
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        date_str  = datetime.today().strftime("%Y-%m-%d")
+        filename  = self.output_dir / f"weekly_report_{date_str}.md"
+        content   = self._to_markdown(result)
+        filename.write_text(content, encoding="utf-8")
+        log.info("Weekly report saved: %s", filename)
+        return filename
 
-    # ------------------------------------------------------------------
-    # Build report
-    # ------------------------------------------------------------------
-
-    def _build(self, weeks: int = 4) -> str:
-        trades = self._load_closed_trades(weeks)
-        if not trades:
-            return f"No closed trades in the last {weeks} weeks."
-
-        today = datetime.date.today()
-        lines = [
-            f"# Martin Quant Weekly Review",
-            f"**Period:** Last {weeks} weeks | **Generated:** {today}",
-            "",
-        ]
-
-        # --- Overview ---
-        r_list    = [t["r_multiple"] for t in trades]
-        pnl_list  = [t["pnl_dollars"] for t in trades]
-        wins      = [r for r in r_list if r > 0]
-        losses    = [r for r in r_list if r <= 0]
-        win_rate  = len(wins) / len(r_list) * 100 if r_list else 0
-        total_r   = sum(r_list)
-        avg_win   = sum(wins) / len(wins) if wins else 0
-        avg_loss  = sum(losses) / len(losses) if losses else 0
-        exp_val   = (win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss)
-        gross_p   = sum(p for p in pnl_list if p > 0)
-        gross_l   = abs(sum(p for p in pnl_list if p < 0))
-        pf        = gross_p / gross_l if gross_l > 0 else float("inf")
-
-        lines += [
-            "## Overview",
-            f"| Metric | Value |",
-            f"|--------|-------|",
-            f"| Total Trades | {len(trades)} |",
-            f"| Win Rate | {win_rate:.1f}% |",
-            f"| Total R | {total_r:+.2f}R |",
-            f"| Avg Win | {avg_win:+.2f}R |",
-            f"| Avg Loss | {avg_loss:+.2f}R |",
-            f"| Expectancy | {exp_val:+.2f}R |",
-            f"| Profit Factor | {pf:.2f} |",
-            f"| Total P&L | ${sum(pnl_list):,.0f} |",
-            "",
-        ]
-
-        # --- Setup breakdown ---
-        setup_stats: dict[str, list] = defaultdict(list)
-        for t in trades:
-            setup_stats[t["setup_type"]].append(t["r_multiple"])
-
-        lines += ["## Setup Breakdown", "| Setup | Trades | Win% | Avg R |", "|-------|--------|------|-------|",]
-        for setup, rs in sorted(setup_stats.items(), key=lambda x: sum(x[1]), reverse=True):
-            w = len([r for r in rs if r > 0])
-            lines.append(
-                f"| {setup} | {len(rs)} | {w/len(rs)*100:.0f}% | {sum(rs)/len(rs):+.2f}R |"
+    def send_telegram(
+        self,
+        weeks: int = 1,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> None:
+        """透過 alert_manager 傳送 Telegram 週報摘要"""
+        try:
+            from martin_quant.utils.alert_manager import AlertManager
+            result = self.generate(
+                weeks=weeks,
+                start_date=start_date,
+                end_date=end_date,
+                print_report=False,
             )
-        lines.append("")
+            msg = self._to_telegram(result)
+            am  = AlertManager()
+            am.send_message(msg)
+            log.info("Weekly report sent to Telegram")
+        except Exception as e:
+            log.warning("send_telegram failed: %s", e)
 
-        # --- Sector breakdown ---
-        sector_stats: dict[str, list] = defaultdict(list)
-        for t in trades:
-            sector_stats[t.get("sector", "unknown")].append(t["r_multiple"])
+    # -----------------------------------------------------------------------
+    # Formatters
+    # -----------------------------------------------------------------------
 
-        if sector_stats:
-            lines += ["## Sector Performance", "| Sector | Trades | Total R |", "|--------|--------|--------|",]
-            for sec, rs in sorted(sector_stats.items(), key=lambda x: sum(x[1]), reverse=True):
-                lines.append(f"| {sec} | {len(rs)} | {sum(rs):+.2f}R |")
+    def _to_markdown(self, r: ReviewResult) -> str:
+        """生成 Markdown 格式週報"""
+        lines = [
+            f"# Martin Quant Weekly Report",
+            f"**Period:** {r.period_label}  ",
+            f"**Generated:** {datetime.today().strftime('%Y-%m-%d %H:%M')}\n",
+            "## Performance Summary\n",
+            "| Metric | Value |",
+            "|---|---|",
+            f"| Trades | {r.n_trades} ({r.n_wins}W / {r.n_losses}L) |",
+            f"| Win Rate | {r.win_rate*100:.1f}% |",
+            f"| Avg R | {r.avg_r:+.2f}R |",
+            f"| Total R | {r.total_r:+.2f}R |",
+            f"| Net P&L | ${r.total_pnl:,.0f} |",
+            f"| Profit Factor | {r.profit_factor:.2f} |",
+            f"| Expectancy | {r.expectancy:+.3f}R |",
+            f"| Max Drawdown | {r.max_drawdown_r:.2f}R |",
+            f"| Best Trade | {r.best_trade} |",
+            f"| Worst Trade | {r.worst_trade} |\n",
+        ]
+
+        if r.by_setup:
+            lines.append("## By Setup Type\n")
+            lines.append("| Setup | Trades | Win% | Avg R | Total R | PF |")
+            lines.append("|---|---|---|---|---|---|")
+            for s in sorted(r.by_setup, key=lambda x: x.total_r, reverse=True):
+                lines.append(
+                    f"| {s.setup_type} | {s.n_trades} "
+                    f"| {s.win_rate*100:.0f}% "
+                    f"| {s.avg_r:+.2f}R "
+                    f"| {s.total_r:+.2f}R "
+                    f"| {s.profit_factor:.2f} |"
+                )
             lines.append("")
 
-        # --- Exit type analysis ---
-        exit_stats: dict[str, list] = defaultdict(list)
-        for t in trades:
-            exit_stats[t.get("exit_type", "unknown")].append(t["r_multiple"])
+        if r.by_sector:
+            lines.append("## By Sector\n")
+            lines.append("| Sector | Total R |")
+            lines.append("|---|---|")
+            for sec, tr in sorted(r.by_sector.items(), key=lambda x: x[1], reverse=True):
+                lines.append(f"| {sec} | {tr:+.2f}R |")
+            lines.append("")
 
-        lines += ["## Exit Type Analysis", "| Exit Type | Count | Avg R |", "|-----------|-------|-------|",]
-        for etype, rs in sorted(exit_stats.items(), key=lambda x: len(x[1]), reverse=True):
-            lines.append(f"| {etype} | {len(rs)} | {sum(rs)/len(rs):+.2f}R |")
-        lines.append("")
+        if r.by_regime:
+            lines.append("## By Regime\n")
+            lines.append("| Regime | Win Rate |")
+            lines.append("|---|---|")
+            for reg, wr in r.by_regime.items():
+                lines.append(f"| {reg} | {wr*100:.1f}% |")
+            lines.append("")
 
-        # --- Best & Worst ---
-        sorted_trades = sorted(trades, key=lambda t: t["r_multiple"], reverse=True)
-        lines.append("## Best Trades")
-        for t in sorted_trades[:3]:
-            lines.append(
-                f"- **{t['symbol']}** `{t['setup_type']}` "
-                f"{t['entry_date']} → {t['exit_date']} "
-                f"R={t['r_multiple']:+.2f} P&L=${t['pnl_dollars']:,.0f}"
-            )
-        lines.append("")
-
-        lines.append("## Worst Trades")
-        for t in sorted_trades[-3:]:
-            lines.append(
-                f"- **{t['symbol']}** `{t['setup_type']}` "
-                f"{t['entry_date']} → {t['exit_date']} "
-                f"R={t['r_multiple']:+.2f} P&L=${t['pnl_dollars']:,.0f}"
-            )
-        lines.append("")
-
-        # --- Lessons (auto-generated) ---
-        lines.append("## Auto Insights")
-        if win_rate < 40:
-            lines.append("- ⚠️ Win rate below 40% — review entry criteria")
-        if avg_win < 1.5:
-            lines.append("- ⚠️ Average win < 1.5R — let winners run longer")
-        if avg_loss < -1.5:
-            lines.append("- ⚠️ Average loss > 1.5R — check stop placement")
-        best_setup = max(setup_stats, key=lambda s: sum(setup_stats[s]))
-        lines.append(f"- ✅ Best performing setup: **{best_setup}** ({sum(setup_stats[best_setup]):+.1f}R)")
-        if exp_val > 0:
-            lines.append(f"- ✅ Positive expectancy: {exp_val:+.2f}R per trade")
-        else:
-            lines.append(f"- ❌ Negative expectancy: {exp_val:+.2f}R — strategy review needed")
+        if r.improvement_notes:
+            lines.append("## Improvement Notes\n")
+            for note in r.improvement_notes:
+                lines.append(f"- {note}")
+            lines.append("")
 
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------
-    # Data loading
-    # ------------------------------------------------------------------
-
-    def _load_closed_trades(self, weeks: int) -> list[dict]:
-        """Load closed trades from last N weeks"""
-        if not Path(self.trades_file).exists():
-            log.warning("trades_file not found: %s", self.trades_file)
-            return []
-
-        cutoff = datetime.date.today() - datetime.timedelta(weeks=weeks)
-        result = []
-
-        with open(self.trades_file, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                if row.get("status") != "closed":
-                    continue
-                try:
-                    exit_date = datetime.date.fromisoformat(row["exit_date"])
-                    if exit_date < cutoff:
-                        continue
-                    result.append({
-                        "symbol":     row["symbol"],
-                        "setup_type": row["setup_type"],
-                        "sector":     row.get("sector", ""),
-                        "theme":      row.get("theme", ""),
-                        "entry_date": row["entry_date"],
-                        "exit_date":  row["exit_date"],
-                        "exit_type":  row.get("exit_type", ""),
-                        "r_multiple": float(row.get("r_multiple", 0)),
-                        "pnl_dollars": float(row.get("pnl_dollars", 0)),
-                    })
-                except Exception:
-                    continue
-        return result
+    def _to_telegram(self, r: ReviewResult) -> str:
+        """Telegram 格式（簡短）"""
+        emoji = "📈" if r.total_r > 0 else "📉"
+        lines = [
+            f"{emoji} *Weekly Review* — {r.period_label}",
+            f"Trades: {r.n_trades} ({r.n_wins}W/{r.n_losses}L)  WR: {r.win_rate*100:.0f}%",
+            f"Avg R: {r.avg_r:+.2f}  Total R: {r.total_r:+.2f}  PnL: ${r.total_pnl:,.0f}",
+            f"PF: {r.profit_factor:.2f}  Expect: {r.expectancy:+.3f}R",
+            f"Best: {r.best_trade}  Worst: {r.worst_trade}",
+        ]
+        if r.improvement_notes:
+            lines.append(f"\n📌 {r.improvement_notes[0]}")
+        return "\n".join(lines)

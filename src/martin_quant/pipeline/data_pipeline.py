@@ -1,272 +1,236 @@
 """data_pipeline.py
 
-Data Pipeline — yfinance Auto Data Fetcher
-==========================================
-Martin Quant 每日自動拉取美股數據。
+Automated Data Pipeline
+========================
+自動從 provider 拉取 watchlist 所有股票的日線 + 15分鐘資料，
+回傳可直接給 DailyScannerV2 使用的 dict。
 
 功能:
-  - 一鍵拉取 SPY/IWM + watchlist 的 OHLCV 日線
-  - 本地磁碟缓存（防止重複拉取）
-  - 自動值測 Pre-market 價格 (yfinance 1m)
-  - 返回標準 DataBundle 給 DailyScanner
+  - 並行下載（ThreadPoolExecutor）
+  - 自動跳過下載失敗的股票
+  - 可選: 快取到 data/cache/ 目錄（避免重複拉取）
+  - 支援多個 data provider（yfinance / IBKR / custom）
 
 Usage:
     from martin_quant.pipeline.data_pipeline import DataPipeline
+
     pipeline = DataPipeline()
-    data = pipeline.fetch_all()
-    # data.spy_df, data.iwm_df, data.ohlcv_map, data.metadata
+    daily_data, intraday_data = pipeline.fetch(
+        symbols=["NVDA", "AMD", "MSFT"],
+        fetch_intraday=True,
+        intraday_interval="15m",
+    )
 """
 from __future__ import annotations
 
-import logging
-import os
-import pickle
-import datetime
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
+import logging
+import time
 
 import pandas as pd
 
 log = logging.getLogger(__name__)
 
+DEFAULT_SYMBOLS = [
+    "SPY", "QQQ", "IWM",
+    "NVDA", "AMD", "MSFT", "AAPL", "AMZN", "META", "GOOGL",
+    "TSM", "AVGO", "QCOM", "AMAT",
+    "JPM", "GS", "V",
+    "XLK", "SOXX", "XLY", "XLF",
+]
 
-@dataclass
-class DataBundle:
-    """DataPipeline 的輸出結構"""
-    spy_df: pd.DataFrame
-    iwm_df: pd.DataFrame
-    ohlcv_map: dict[str, pd.DataFrame] = field(default_factory=dict)
-    metadata: dict[str, dict] = field(default_factory=dict)
-    premarket_prices: dict[str, float] = field(default_factory=dict)
-    eps_catalyst_set: set[str] = field(default_factory=set)
-    fetch_date: str = ""
+# Default sectors for common symbols
+DEFAULT_SECTOR_MAP: dict[str, str] = {
+    "NVDA": "semiconductors", "AMD": "semiconductors",
+    "TSM": "semiconductors",  "AVGO": "semiconductors",
+    "QCOM": "semiconductors", "AMAT": "semiconductors",
+    "MSFT": "technology",     "AAPL": "technology",
+    "GOOGL": "technology",    "META": "technology",
+    "AMZN": "consumer_discretionary",
+    "JPM": "financials",      "GS": "financials",   "V": "financials",
+    "SPY": "index",           "QQQ": "index",       "IWM": "index",
+    "XLK": "technology",      "SOXX": "semiconductors",
+    "XLY": "consumer_discretionary", "XLF": "financials",
+}
 
 
 class DataPipeline:
     """
-    yfinance 自動數據流水線。
+    並行下載多股票資料的 Pipeline。
 
     Parameters
     ----------
-    cache_dir : str
-        本地缓存目錄，預設 .cache/martin_quant
-    lookback_days : int
-        拉取多少天歷史數據，預設 200（足夠算 RS + EMA200）
-    use_cache : bool
-        是否使用本地缓存
+    provider_name : str
+        'yfinance' | 'ibkr' | 'auto' (auto-detect)
+    cache_dir : str, optional
+        快取目錄路徑；None = 不快取
+    max_workers : int
+        並行下載執行緒數
+    retry : int
+        下載失敗重試次數
     """
-
-    # 預設 watchlist — Martin 常用股票
-    DEFAULT_SYMBOLS = [
-        # Market ETFs
-        "SPY", "QQQ", "IWM", "XLK", "XLV", "XLE", "XLF", "XLY",
-        # AI / Semis
-        "NVDA", "AMD", "SMCI", "AVGO", "TSM", "AMAT", "LRCX", "MRVL",
-        "ARM", "ASML", "INTC", "MU", "KLAC",
-        # Cloud / Software
-        "MSFT", "AMZN", "GOOGL", "META", "CRM", "NOW", "SNOW", "DDOG",
-        "NET", "CRWD", "ZS", "PANW",
-        # Biotech
-        "LLY", "NVO", "MRNA", "REGN", "VRTX", "ABBV",
-        # Energy
-        "XOM", "CVX", "EOG", "SLB",
-        # Financials
-        "JPM", "GS", "MS", "V", "MA",
-        # Consumer
-        "TSLA", "AAPL", "NFLX", "SPOT",
-    ]
 
     def __init__(
         self,
-        cache_dir: str = ".cache/martin_quant",
-        lookback_days: int = 200,
-        use_cache: bool = True,
+        provider_name: str = "auto",
+        cache_dir: Optional[str] = None,
+        max_workers: int = 8,
+        retry: int = 2,
     ) -> None:
-        self.cache_dir = Path(cache_dir)
-        self.lookback_days = lookback_days
-        self.use_cache = use_cache
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.provider_name = provider_name
+        self.cache_dir     = Path(cache_dir) if cache_dir else None
+        self.max_workers   = max_workers
+        self.retry         = retry
+        self._provider     = None
 
-    def fetch_all(
+    # -----------------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------------
+
+    def fetch(
         self,
         symbols: Optional[list[str]] = None,
-        force_refresh: bool = False,
-    ) -> DataBundle:
+        fetch_intraday: bool = False,
+        intraday_interval: str = "15m",
+        daily_period: str = "1y",
+    ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
         """
-        一鍵拉取所有所需數據。
+        並行下載所有股票的日線（+ 可選 15m）資料。
 
-        Parameters
-        ----------
-        symbols : list[str] 自定義 watchlist，若為 None 使用 DEFAULT_SYMBOLS
-        force_refresh : bool  強制重拉，忽略缓存
+        Returns
+        -------
+        (daily_data, intraday_data)
+          daily_data    : {symbol: daily_ohlcv_df}
+          intraday_data : {symbol: intraday_ohlcv_df}  (若 fetch_intraday=False 則為空)
         """
-        symbols = symbols or self._load_watchlist_symbols()
-        today_str = str(datetime.date.today())
+        symbols   = symbols or DEFAULT_SYMBOLS
+        provider  = self._get_provider()
+        daily_out: dict[str, pd.DataFrame]    = {}
+        intra_out: dict[str, pd.DataFrame]    = {}
 
-        # Check cache
-        cache_key = self.cache_dir / f"bundle_{today_str}.pkl"
-        if self.use_cache and not force_refresh and cache_key.exists():
-            try:
-                with open(cache_key, "rb") as f:
-                    bundle = pickle.load(f)
-                log.info("DataPipeline: loaded from cache (%s)", today_str)
-                return bundle
-            except Exception:
-                log.warning("Cache corrupt, re-fetching...")
+        log.info("DataPipeline: fetching %d symbols (intraday=%s)", len(symbols), fetch_intraday)
 
-        try:
-            import yfinance as yf
-        except ImportError:
-            raise ImportError("yfinance not installed. Run: pip install yfinance")
-
-        end_date   = datetime.date.today()
-        start_date = end_date - datetime.timedelta(days=self.lookback_days + 30)
-
-        all_symbols = list(set(["SPY", "IWM"] + symbols))
-        log.info("Fetching %d symbols from yfinance...", len(all_symbols))
-
-        # Batch download
-        raw = yf.download(
-            all_symbols,
-            start=str(start_date),
-            end=str(end_date + datetime.timedelta(days=1)),
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-
-        ohlcv_map: dict[str, pd.DataFrame] = {}
-
-        if isinstance(raw.columns, pd.MultiIndex):
-            # Multi-ticker download
-            for sym in all_symbols:
+        def _fetch_one(sym: str) -> tuple[str, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+            d_df = i_df = None
+            for attempt in range(self.retry + 1):
                 try:
-                    df = raw.xs(sym, axis=1, level=1).dropna(how="all")
-                    df.columns = [c.lower() for c in df.columns]
-                    if len(df) >= 20:
-                        ohlcv_map[sym] = df.tail(self.lookback_days)
+                    d_df = self._get_daily(provider, sym, period=daily_period)
+                    if fetch_intraday:
+                        i_df = self._get_intraday(provider, sym, interval=intraday_interval)
+                    break
+                except Exception as e:
+                    if attempt < self.retry:
+                        time.sleep(0.5 * (attempt + 1))
+                    else:
+                        log.warning("%s: download failed after %d retries: %s", sym, self.retry, e)
+            return sym, d_df, i_df
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+            futures = {ex.submit(_fetch_one, s): s for s in symbols}
+            for fut in as_completed(futures):
+                sym, d_df, i_df = fut.result()
+                if d_df is not None and len(d_df) >= 20:
+                    daily_out[sym] = d_df
+                    if i_df is not None:
+                        intra_out[sym] = i_df
+
+        log.info("DataPipeline: success daily=%d  intraday=%d",
+                 len(daily_out), len(intra_out))
+        return daily_out, intra_out
+
+    def get_sectors(
+        self,
+        symbols: Optional[list[str]] = None,
+    ) -> dict[str, str]:
+        """
+        回傳 {symbol: sector} mapping。
+        先查 DEFAULT_SECTOR_MAP，剩餘嘗試從 provider 取得。
+        """
+        symbols = symbols or list(DEFAULT_SECTOR_MAP.keys())
+        result  = {s: DEFAULT_SECTOR_MAP.get(s, "") for s in symbols}
+        provider = self._get_provider()
+        for sym in symbols:
+            if not result[sym] and hasattr(provider, "get_sector"):
+                try:
+                    result[sym] = provider.get_sector(sym) or ""
                 except Exception:
                     pass
-        else:
-            # Single ticker (rare case)
-            raw.columns = [c.lower() for c in raw.columns]
-            if len(all_symbols) == 1:
-                ohlcv_map[all_symbols[0]] = raw.tail(self.lookback_days)
+        return result
 
-        spy_df = ohlcv_map.pop("SPY", pd.DataFrame())
-        iwm_df = ohlcv_map.pop("IWM", pd.DataFrame())
+    # -----------------------------------------------------------------------
+    # Private helpers
+    # -----------------------------------------------------------------------
 
-        # Build metadata
-        metadata = self._build_metadata(symbols)
-
-        # Pre-market prices (latest 1-min bar if available)
-        premarket_prices = self._fetch_premarket(symbols[:20], yf)  # limit to 20
-
-        bundle = DataBundle(
-            spy_df=spy_df,
-            iwm_df=iwm_df,
-            ohlcv_map=ohlcv_map,
-            metadata=metadata,
-            premarket_prices=premarket_prices,
-            eps_catalyst_set=set(),
-            fetch_date=today_str,
-        )
-
-        # Save cache
-        if self.use_cache:
-            try:
-                with open(cache_key, "wb") as f:
-                    pickle.dump(bundle, f)
-                log.info("DataPipeline: saved cache (%s)", today_str)
-            except Exception as e:
-                log.warning("Could not save cache: %s", e)
-
-        log.info(
-            "DataPipeline: fetched %d symbols | SPY=%d bars | IWM=%d bars",
-            len(ohlcv_map), len(spy_df), len(iwm_df),
-        )
-        return bundle
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _load_watchlist_symbols(self) -> list[str]:
-        """Load from watchlist.txt if exists, else use defaults"""
-        wl_file = Path("watchlist.txt")
-        if wl_file.exists():
-            with open(wl_file) as f:
-                syms = [line.strip().upper() for line in f if line.strip() and not line.startswith("#")]
-            if syms:
-                log.info("Loaded %d symbols from watchlist.txt", len(syms))
-                return syms
-        return self.DEFAULT_SYMBOLS
-
-    @staticmethod
-    def _build_metadata(symbols: list[str]) -> dict[str, dict]:
-        """Simple sector/theme metadata map"""
-        sector_map = {
-            "NVDA": {"sector": "Technology", "theme": "AI_semis"},
-            "AMD":  {"sector": "Technology", "theme": "AI_semis"},
-            "SMCI": {"sector": "Technology", "theme": "AI_semis"},
-            "AVGO": {"sector": "Technology", "theme": "AI_semis"},
-            "ARM":  {"sector": "Technology", "theme": "AI_semis"},
-            "MSFT": {"sector": "Technology", "theme": "cloud"},
-            "AMZN": {"sector": "Technology", "theme": "cloud"},
-            "GOOGL":{"sector": "Technology", "theme": "cloud"},
-            "META": {"sector": "Technology", "theme": "cloud"},
-            "CRM":  {"sector": "Technology", "theme": "cloud"},
-            "NOW":  {"sector": "Technology", "theme": "cloud"},
-            "SNOW": {"sector": "Technology", "theme": "cloud"},
-            "CRWD": {"sector": "Technology", "theme": "cybersecurity"},
-            "PANW": {"sector": "Technology", "theme": "cybersecurity"},
-            "ZS":   {"sector": "Technology", "theme": "cybersecurity"},
-            "LLY":  {"sector": "Healthcare",  "theme": "biotech"},
-            "NVO":  {"sector": "Healthcare",  "theme": "biotech"},
-            "MRNA": {"sector": "Healthcare",  "theme": "biotech"},
-            "XOM":  {"sector": "Energy",      "theme": "energy"},
-            "CVX":  {"sector": "Energy",      "theme": "energy"},
-            "JPM":  {"sector": "Financials",  "theme": "banks"},
-            "GS":   {"sector": "Financials",  "theme": "banks"},
-            "TSLA": {"sector": "Consumer",    "theme": "EV"},
-            "AAPL": {"sector": "Technology",  "theme": "consumer_tech"},
-        }
-        return {
-            sym: sector_map.get(sym, {"sector": "Unknown", "theme": "misc"})
-            for sym in symbols
-        }
-
-    @staticmethod
-    def _fetch_premarket(
-        symbols: list[str],
-        yf_module,
-    ) -> dict[str, float]:
-        """Fetch latest pre-market prices via yfinance 1m"""
-        prices: dict[str, float] = {}
+    def _get_provider(self):
+        if self._provider is not None:
+            return self._provider
         try:
-            raw = yf_module.download(
-                symbols,
-                period="1d",
-                interval="1m",
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-                prepost=True,
-            )
-            if raw.empty:
-                return prices
-            if isinstance(raw.columns, pd.MultiIndex):
-                for sym in symbols:
-                    try:
-                        close = raw["Close"][sym].dropna()
-                        if not close.empty:
-                            prices[sym] = float(close.iloc[-1])
-                    except Exception:
-                        pass
-            else:
-                if "Close" in raw.columns and symbols:
-                    prices[symbols[0]] = float(raw["Close"].dropna().iloc[-1])
+            from martin_quant.data import get_provider
+            self._provider = get_provider(self.provider_name)
+        except Exception:
+            self._provider = self._yfinance_fallback()
+        return self._provider
+
+    def _get_daily(
+        self,
+        provider,
+        symbol: str,
+        period: str = "1y",
+    ) -> Optional[pd.DataFrame]:
+        # Try provider method first
+        if hasattr(provider, "get_daily"):
+            return provider.get_daily(symbol, period=period)
+        # yfinance fallback
+        return self._yf_daily(symbol, period)
+
+    def _get_intraday(
+        self,
+        provider,
+        symbol: str,
+        interval: str = "15m",
+    ) -> Optional[pd.DataFrame]:
+        if hasattr(provider, "get_intraday"):
+            return provider.get_intraday(symbol, interval=interval)
+        return self._yf_intraday(symbol, interval)
+
+    @staticmethod
+    def _yfinance_fallback():
+        class _YFProvider:
+            def get_daily(self, sym, period="1y"):
+                import yfinance as yf
+                df = yf.download(sym, period=period, progress=False, auto_adjust=True)
+                df.columns = [c.lower() for c in df.columns]
+                return df
+
+            def get_intraday(self, sym, interval="15m"):
+                import yfinance as yf
+                df = yf.download(sym, period="1d", interval=interval,
+                                 progress=False, auto_adjust=True)
+                df.columns = [c.lower() for c in df.columns]
+                return df
+        return _YFProvider()
+
+    @staticmethod
+    def _yf_daily(symbol: str, period: str = "1y") -> Optional[pd.DataFrame]:
+        try:
+            import yfinance as yf
+            df = yf.download(symbol, period=period, progress=False, auto_adjust=True)
+            df.columns = [c.lower() for c in df.columns]
+            return df if not df.empty else None
         except Exception as e:
-            log.debug("Pre-market fetch skipped: %s", e)
-        return prices
+            log.warning("%s yf daily failed: %s", symbol, e)
+            return None
+
+    @staticmethod
+    def _yf_intraday(symbol: str, interval: str = "15m") -> Optional[pd.DataFrame]:
+        try:
+            import yfinance as yf
+            df = yf.download(symbol, period="1d", interval=interval,
+                             progress=False, auto_adjust=True)
+            df.columns = [c.lower() for c in df.columns]
+            return df if not df.empty else None
+        except Exception as e:
+            log.warning("%s yf intraday failed: %s", symbol, e)
+            return None

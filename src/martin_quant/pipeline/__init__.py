@@ -1,5 +1,4 @@
-"""martin_quant.pipeline — data acquisition & watchlist"""
-from martin_quant.pipeline.data_pipeline import DataPipeline, DataBundle
-from martin_quant.pipeline.watchlist_updater import WatchlistUpdater
+"""pipeline — Automated data pipeline"""
+from .data_pipeline import DataPipeline, DEFAULT_SYMBOLS, DEFAULT_SECTOR_MAP
 
-__all__ = ["DataPipeline", "DataBundle", "WatchlistUpdater"]
+__all__ = ["DataPipeline", "DEFAULT_SYMBOLS", "DEFAULT_SECTOR_MAP"]

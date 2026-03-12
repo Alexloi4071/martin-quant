@@ -1,4 +1,4 @@
-"""martin_quant.cli — command line interface"""
-from martin_quant.cli.main import main
+"""cli — Martin Quant command-line interface"""
+from .main import main
 
 __all__ = ["main"]
