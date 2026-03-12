@@ -1,9 +1,40 @@
 [project]
 name = "martin-quant"
-version = "0.1.0"
+version = "0.17.0"
 description = "Standalone quantitative research framework for Martin-style stock selection and timing"
 requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "yfinance>=0.2",
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    "ta>=0.11",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov",
+    "black",
+    "ruff",
+]
+
+[project.scripts]
+"martin-scan"    = "martin_quant.cli.main:main"
+"martin-scan-v2" = "martin_quant.scripts.run_daily_scan_v2:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
