@@ -1,236 +1,359 @@
 """data_pipeline.py
 
-Automated Data Pipeline
-========================
-自動從 provider 拉取 watchlist 所有股票的日線 + 15分鐘資料，
-回傳可直接給 DailyScannerV2 使用的 dict。
+Automated data pipeline — fetches all OHLCV, metadata, and earnings data
+needed for the daily scan.
 
-功能:
-  - 並行下載（ThreadPoolExecutor）
-  - 自動跳過下載失敗的股票
-  - 可選: 快取到 data/cache/ 目錄（避免重複拉取）
-  - 支援多個 data provider（yfinance / IBKR / custom）
+Features:
+  - Auto-builds watchlist from S&P500 + NASDAQ100 + custom universe
+  - Concurrent OHLCV fetch (ThreadPoolExecutor)
+  - Cached to local Parquet (no re-fetch if data fresh < 4h)
+  - Earnings calendar integration (from yfinance or local CSV)
+  - Pre-market price snapshot
+  - Error handling + partial result recovery
 
 Usage:
-    from martin_quant.pipeline.data_pipeline import DataPipeline
-
-    pipeline = DataPipeline()
-    daily_data, intraday_data = pipeline.fetch(
-        symbols=["NVDA", "AMD", "MSFT"],
-        fetch_intraday=True,
-        intraday_interval="15m",
-    )
+    pipeline = DataPipeline(cache_dir="data/cache", universe="sp500")
+    data = pipeline.run()
+    # data.ohlcv_map, data.spy_df, data.iwm_df, data.metadata,
+    # data.eps_catalyst_set, data.premarket_prices
 """
 from __future__ import annotations
 
+import logging
+import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
-import logging
-import time
 
 import pandas as pd
 
 log = logging.getLogger(__name__)
 
-DEFAULT_SYMBOLS = [
-    "SPY", "QQQ", "IWM",
-    "NVDA", "AMD", "MSFT", "AAPL", "AMZN", "META", "GOOGL",
-    "TSM", "AVGO", "QCOM", "AMAT",
-    "JPM", "GS", "V",
-    "XLK", "SOXX", "XLY", "XLF",
+# Default universe lists
+SP500_TICKERS: list[str] = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","BRK-B",
+    "JPM","LLY","V","UNH","XOM","MA","JNJ","PG","HD","COST","MRK",
+    "ABBV","CVX","BAC","KO","PEP","ADBE","CRM","NFLX","WMT","ACN",
+    "MCD","AMD","CSCO","LIN","DIS","ABT","DHR","TXN","INTU","VZ",
+    "PM","NEE","RTX","HON","AMGN","SPGI","T","IBM","GE","CAT",
+    "GS","BLK","NOW","ISRG","UBER","SHW","AMAT","MU","LRCX","KLAC",
+    "PANW","CRWD","SNOW","DDOG","NET","ZS","ENPH","FSLR","CEG","VST",
+    "SMCI","MRVL","ARM","PLTR","SOFI","HOOD","COIN","MSTR",
+    "SPY","QQQ","IWM","SMH","XLK","XLF","XLE","XLV","XLI","XLY",
 ]
 
-# Default sectors for common symbols
-DEFAULT_SECTOR_MAP: dict[str, str] = {
-    "NVDA": "semiconductors", "AMD": "semiconductors",
-    "TSM": "semiconductors",  "AVGO": "semiconductors",
-    "QCOM": "semiconductors", "AMAT": "semiconductors",
-    "MSFT": "technology",     "AAPL": "technology",
-    "GOOGL": "technology",    "META": "technology",
-    "AMZN": "consumer_discretionary",
-    "JPM": "financials",      "GS": "financials",   "V": "financials",
-    "SPY": "index",           "QQQ": "index",       "IWM": "index",
-    "XLK": "technology",      "SOXX": "semiconductors",
-    "XLY": "consumer_discretionary", "XLF": "financials",
-}
+NASDAQ_GROWTH: list[str] = [
+    "CELH","DUOL","CPNG","DOCS","AXON","FTNT","GDDY","CSGP","VEEV",
+    "HUBS","APP","TTD","GLBE","SQ","PYPL","SHOP","SPOT","PINS",
+    "RBLX","U","RIVN","LCID","NIO","XPEV","LI",
+]
 
+
+# ---------------------------------------------------------------------------
+# Data container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PipelineData:
+    ohlcv_map: dict[str, pd.DataFrame] = field(default_factory=dict)
+    spy_df: Optional[pd.DataFrame] = None
+    iwm_df: Optional[pd.DataFrame] = None
+    metadata: dict[str, dict] = field(default_factory=dict)
+    eps_catalyst_set: set[str] = field(default_factory=set)
+    premarket_prices: dict[str, float] = field(default_factory=dict)
+    premarket_volumes: dict[str, float] = field(default_factory=dict)
+    fetch_errors: dict[str, str] = field(default_factory=dict)
+    fetched_at: str = ""
+    symbols_fetched: int = 0
+
+    def is_valid(self) -> bool:
+        return self.spy_df is not None and len(self.ohlcv_map) > 0
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
 
 class DataPipeline:
     """
-    並行下載多股票資料的 Pipeline。
+    Automated daily data fetcher.
 
     Parameters
     ----------
-    provider_name : str
-        'yfinance' | 'ibkr' | 'auto' (auto-detect)
-    cache_dir : str, optional
-        快取目錄路徑；None = 不快取
+    cache_dir : str
+        Directory to cache Parquet files
+    universe : str
+        "sp500" | "growth" | "combined" | "custom"
+    custom_symbols : list[str]
+        Extra symbols to add to universe
     max_workers : int
-        並行下載執行緒數
-    retry : int
-        下載失敗重試次數
+        Concurrent fetch threads
+    cache_ttl_hours : float
+        Hours before cached data is considered stale
     """
 
     def __init__(
         self,
-        provider_name: str = "auto",
-        cache_dir: Optional[str] = None,
+        cache_dir: str = "data/cache",
+        universe: str = "combined",
+        custom_symbols: Optional[list[str]] = None,
         max_workers: int = 8,
-        retry: int = 2,
+        cache_ttl_hours: float = 4.0,
+        period: str = "1y",
     ) -> None:
-        self.provider_name = provider_name
-        self.cache_dir     = Path(cache_dir) if cache_dir else None
-        self.max_workers   = max_workers
-        self.retry         = retry
-        self._provider     = None
+        self.cache_dir       = Path(cache_dir)
+        self.universe        = universe
+        self.custom_symbols  = custom_symbols or []
+        self.max_workers     = max_workers
+        self.cache_ttl       = timedelta(hours=cache_ttl_hours)
+        self.period          = period
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # -----------------------------------------------------------------------
-    # Public API
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Universe builder
+    # ------------------------------------------------------------------
 
-    def fetch(
+    def build_universe(self) -> list[str]:
+        syms: set[str] = set()
+        if self.universe in ("sp500", "combined"):
+            syms.update(SP500_TICKERS)
+        if self.universe in ("growth", "combined"):
+            syms.update(NASDAQ_GROWTH)
+        syms.update(self.custom_symbols)
+        # Always include index ETFs
+        syms.update(["SPY", "IWM", "QQQ", "SMH"])
+        return sorted(syms)
+
+    # ------------------------------------------------------------------
+    # Cache helpers
+    # ------------------------------------------------------------------
+
+    def _cache_path(self, symbol: str) -> Path:
+        return self.cache_dir / f"{symbol.replace('-', '_')}.parquet"
+
+    def _is_fresh(self, path: Path) -> bool:
+        if not path.exists():
+            return False
+        mtime = datetime.fromtimestamp(path.stat().st_mtime)
+        return datetime.now() - mtime < self.cache_ttl
+
+    def _load_cache(self, symbol: str) -> Optional[pd.DataFrame]:
+        p = self._cache_path(symbol)
+        if self._is_fresh(p):
+            try:
+                return pd.read_parquet(p)
+            except Exception:
+                return None
+        return None
+
+    def _save_cache(self, symbol: str, df: pd.DataFrame) -> None:
+        try:
+            df.to_parquet(self._cache_path(symbol))
+        except Exception as e:
+            log.debug("Cache save failed %s: %s", symbol, e)
+
+    # ------------------------------------------------------------------
+    # Fetch single symbol
+    # ------------------------------------------------------------------
+
+    def _fetch_one(
         self,
-        symbols: Optional[list[str]] = None,
-        fetch_intraday: bool = False,
-        intraday_interval: str = "15m",
-        daily_period: str = "1y",
-    ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
-        """
-        並行下載所有股票的日線（+ 可選 15m）資料。
+        symbol: str,
+        force: bool = False,
+    ) -> tuple[str, Optional[pd.DataFrame]]:
+        if not force:
+            cached = self._load_cache(symbol)
+            if cached is not None:
+                return symbol, cached
 
-        Returns
-        -------
-        (daily_data, intraday_data)
-          daily_data    : {symbol: daily_ohlcv_df}
-          intraday_data : {symbol: intraday_ohlcv_df}  (若 fetch_intraday=False 則為空)
-        """
-        symbols   = symbols or DEFAULT_SYMBOLS
-        provider  = self._get_provider()
-        daily_out: dict[str, pd.DataFrame]    = {}
-        intra_out: dict[str, pd.DataFrame]    = {}
+        # Try provider
+        try:
+            from martin_quant.data.providers import get_provider
+            provider = get_provider()
+            df = provider.get_ohlcv(symbol, period=self.period)
+            if df is not None and len(df) >= 20:
+                self._save_cache(symbol, df)
+                return symbol, df
+        except Exception as e:
+            log.debug("Provider failed %s: %s", symbol, e)
 
-        log.info("DataPipeline: fetching %d symbols (intraday=%s)", len(symbols), fetch_intraday)
+        # Fallback: yfinance
+        try:
+            import yfinance as yf
+            df = yf.download(symbol, period=self.period, progress=False, auto_adjust=True)
+            if df is not None and len(df) >= 20:
+                df.columns = [c.lower() for c in df.columns]
+                self._save_cache(symbol, df)
+                return symbol, df
+        except Exception as e:
+            log.debug("yfinance failed %s: %s", symbol, e)
 
-        def _fetch_one(sym: str) -> tuple[str, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-            d_df = i_df = None
-            for attempt in range(self.retry + 1):
+        return symbol, None
+
+    # ------------------------------------------------------------------
+    # Metadata fetch
+    # ------------------------------------------------------------------
+
+    def _fetch_metadata(self, symbols: list[str]) -> dict[str, dict]:
+        """Fetch sector, market cap, theme metadata."""
+        meta: dict[str, dict] = {}
+        try:
+            import yfinance as yf
+            for sym in symbols:
                 try:
-                    d_df = self._get_daily(provider, sym, period=daily_period)
-                    if fetch_intraday:
-                        i_df = self._get_intraday(provider, sym, interval=intraday_interval)
-                    break
-                except Exception as e:
-                    if attempt < self.retry:
-                        time.sleep(0.5 * (attempt + 1))
-                    else:
-                        log.warning("%s: download failed after %d retries: %s", sym, self.retry, e)
-            return sym, d_df, i_df
+                    info = yf.Ticker(sym).fast_info
+                    meta[sym] = {
+                        "sector":     getattr(info, "sector", ""),
+                        "market_cap": getattr(info, "market_cap", 0),
+                        "theme":      "",  # populated by ThemeMomentumCalc
+                        "eps_date":   "",
+                    }
+                except Exception:
+                    meta[sym] = {"sector": "", "market_cap": 0, "theme": "", "eps_date": ""}
+        except ImportError:
+            log.warning("yfinance not available for metadata fetch")
+        return meta
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
-            futures = {ex.submit(_fetch_one, s): s for s in symbols}
-            for fut in as_completed(futures):
-                sym, d_df, i_df = fut.result()
-                if d_df is not None and len(d_df) >= 20:
-                    daily_out[sym] = d_df
-                    if i_df is not None:
-                        intra_out[sym] = i_df
+    # ------------------------------------------------------------------
+    # Earnings detection
+    # ------------------------------------------------------------------
 
-        log.info("DataPipeline: success daily=%d  intraday=%d",
-                 len(daily_out), len(intra_out))
-        return daily_out, intra_out
-
-    def get_sectors(
+    def _build_eps_set(
         self,
-        symbols: Optional[list[str]] = None,
-    ) -> dict[str, str]:
-        """
-        回傳 {symbol: sector} mapping。
-        先查 DEFAULT_SECTOR_MAP，剩餘嘗試從 provider 取得。
-        """
-        symbols = symbols or list(DEFAULT_SECTOR_MAP.keys())
-        result  = {s: DEFAULT_SECTOR_MAP.get(s, "") for s in symbols}
-        provider = self._get_provider()
-        for sym in symbols:
-            if not result[sym] and hasattr(provider, "get_sector"):
+        symbols: list[str],
+        lookahead_days: int = 3,
+    ) -> set[str]:
+        """Return symbols reporting earnings within lookahead_days."""
+        eps_set: set[str] = set()
+        try:
+            import yfinance as yf
+            from datetime import date
+            today = date.today()
+            for sym in symbols:
                 try:
-                    result[sym] = provider.get_sector(sym) or ""
+                    cal = yf.Ticker(sym).calendar
+                    if cal is not None and not cal.empty:
+                        if "Earnings Date" in cal.index:
+                            ed = cal.loc["Earnings Date"].iloc[0]
+                            if hasattr(ed, "date"):
+                                ed = ed.date()
+                            if 0 <= (ed - today).days <= lookahead_days:
+                                eps_set.add(sym)
+                                log.debug("%s earnings in %d days", sym, (ed - today).days)
                 except Exception:
                     pass
-        return result
+        except ImportError:
+            pass
+        return eps_set
 
-    # -----------------------------------------------------------------------
-    # Private helpers
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Main run
+    # ------------------------------------------------------------------
 
-    def _get_provider(self):
-        if self._provider is not None:
-            return self._provider
-        try:
-            from martin_quant.data import get_provider
-            self._provider = get_provider(self.provider_name)
-        except Exception:
-            self._provider = self._yfinance_fallback()
-        return self._provider
-
-    def _get_daily(
+    def run(
         self,
-        provider,
-        symbol: str,
-        period: str = "1y",
-    ) -> Optional[pd.DataFrame]:
-        # Try provider method first
-        if hasattr(provider, "get_daily"):
-            return provider.get_daily(symbol, period=period)
-        # yfinance fallback
-        return self._yf_daily(symbol, period)
+        force_refresh: bool = False,
+        include_metadata: bool = True,
+        include_earnings: bool = True,
+        premarket_data: Optional[dict[str, float]] = None,
+    ) -> PipelineData:
+        """
+        Run the full data pipeline.
 
-    def _get_intraday(
+        Returns PipelineData with all fields populated.
+        """
+        symbols = self.build_universe()
+        log.info("Pipeline: fetching %d symbols (universe=%s)", len(symbols), self.universe)
+
+        t0 = time.time()
+        ohlcv_map: dict[str, pd.DataFrame] = {}
+        errors: dict[str, str] = {}
+
+        # Concurrent fetch
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            futures = {
+                pool.submit(self._fetch_one, sym, force_refresh): sym
+                for sym in symbols
+            }
+            for future in as_completed(futures):
+                sym = futures[future]
+                try:
+                    _, df = future.result()
+                    if df is not None:
+                        ohlcv_map[sym] = df
+                    else:
+                        errors[sym] = "no_data"
+                except Exception as e:
+                    errors[sym] = str(e)
+
+        elapsed = time.time() - t0
+        log.info(
+            "Fetched %d / %d symbols in %.1fs (%d errors)",
+            len(ohlcv_map), len(symbols), elapsed, len(errors),
+        )
+
+        # SPY / IWM references
+        spy_df = ohlcv_map.get("SPY")
+        iwm_df = ohlcv_map.get("IWM")
+
+        # Remove index ETFs from scan universe
+        scan_symbols = [
+            s for s in ohlcv_map
+            if s not in {"SPY", "IWM", "QQQ", "SMH", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY"}
+        ]
+        scan_ohlcv = {s: ohlcv_map[s] for s in scan_symbols}
+
+        # Metadata
+        meta: dict[str, dict] = {}
+        if include_metadata:
+            log.info("Fetching metadata...")
+            meta = self._fetch_metadata(scan_symbols[:100])  # limit to avoid rate limits
+
+        # Earnings
+        eps_set: set[str] = set()
+        if include_earnings:
+            log.info("Checking earnings calendar...")
+            eps_set = self._build_eps_set(scan_symbols[:50])
+            log.info("EPS catalysts this week: %s", eps_set)
+
+        return PipelineData(
+            ohlcv_map=scan_ohlcv,
+            spy_df=spy_df,
+            iwm_df=iwm_df,
+            metadata=meta,
+            eps_catalyst_set=eps_set,
+            premarket_prices=premarket_data or {},
+            fetch_errors=errors,
+            fetched_at=datetime.now().isoformat(),
+            symbols_fetched=len(ohlcv_map),
+        )
+
+    def run_scan_from_pipeline(
         self,
-        provider,
-        symbol: str,
-        interval: str = "15m",
-    ) -> Optional[pd.DataFrame]:
-        if hasattr(provider, "get_intraday"):
-            return provider.get_intraday(symbol, interval=interval)
-        return self._yf_intraday(symbol, interval)
+        equity: float = 100_000.0,
+        force_refresh: bool = False,
+    ) -> None:
+        """Convenience: run pipeline then daily scan, print results."""
+        data = self.run(force_refresh=force_refresh)
+        if not data.is_valid():
+            log.error("Pipeline returned invalid data — SPY missing")
+            return
 
-    @staticmethod
-    def _yfinance_fallback():
-        class _YFProvider:
-            def get_daily(self, sym, period="1y"):
-                import yfinance as yf
-                df = yf.download(sym, period=period, progress=False, auto_adjust=True)
-                df.columns = [c.lower() for c in df.columns]
-                return df
-
-            def get_intraday(self, sym, interval="15m"):
-                import yfinance as yf
-                df = yf.download(sym, period="1d", interval=interval,
-                                 progress=False, auto_adjust=True)
-                df.columns = [c.lower() for c in df.columns]
-                return df
-        return _YFProvider()
-
-    @staticmethod
-    def _yf_daily(symbol: str, period: str = "1y") -> Optional[pd.DataFrame]:
-        try:
-            import yfinance as yf
-            df = yf.download(symbol, period=period, progress=False, auto_adjust=True)
-            df.columns = [c.lower() for c in df.columns]
-            return df if not df.empty else None
-        except Exception as e:
-            log.warning("%s yf daily failed: %s", symbol, e)
-            return None
-
-    @staticmethod
-    def _yf_intraday(symbol: str, interval: str = "15m") -> Optional[pd.DataFrame]:
-        try:
-            import yfinance as yf
-            df = yf.download(symbol, period="1d", interval=interval,
-                             progress=False, auto_adjust=True)
-            df.columns = [c.lower() for c in df.columns]
-            return df if not df.empty else None
-        except Exception as e:
-            log.warning("%s yf intraday failed: %s", symbol, e)
-            return None
+        from martin_quant.daily_scan import DailyScanner, DailyScanConfig
+        scanner = DailyScanner(config=DailyScanConfig(equity=equity))
+        result  = scanner.run(
+            spy_df=data.spy_df,
+            iwm_df=data.iwm_df,
+            ohlcv_map=data.ohlcv_map,
+            metadata=data.metadata,
+            eps_catalyst_set=data.eps_catalyst_set,
+            premarket_prices=data.premarket_prices,
+        )
+        print(result.summary())
+        df = result.to_dataframe()
+        if not df.empty:
+            df.to_csv(f"scan_{result.date}.csv", index=False)
+            log.info("Saved scan_%s.csv", result.date)

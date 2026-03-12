@@ -1,10 +1,3 @@
-"""review — Trade review & weekly reporting"""
-from .trade_reviewer import TradeReviewer, ReviewResult, SetupStats
-from .weekly_report import WeeklyReport
+from martin_quant.review.weekly_reviewer import WeeklyReviewer, WeeklyReport, TradeRecord
 
-__all__ = [
-    "TradeReviewer",
-    "ReviewResult",
-    "SetupStats",
-    "WeeklyReport",
-]
+__all__ = ["WeeklyReviewer", "WeeklyReport", "TradeRecord"]

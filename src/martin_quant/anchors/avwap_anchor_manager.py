@@ -1,233 +1,262 @@
 """avwap_anchor_manager.py
 
-Multi-Anchor AVWAP Manager
-==========================
-Martin Luk 策略：管理每支股票的多條 AVWAP 錨點，
-提供整合後的支撐/阻力判斷給 DailyScanner 使用。
+Anchored VWAP (AVWAP) support/resistance manager.
 
-典型錨點組合:
-  1. Earnings AVWAP   — 上季財報公告日
-  2. Breakout AVWAP   — 最近突破日
-  3. Major Low AVWAP  — 近60日最低點
-  4. YTD AVWAP        — 年初第一個交易日
+Martin Luk uses AVWAP as a key dynamic support level:
+  - Anchor on earnings date  → EPS AVWAP
+  - Anchor on breakout date  → BO AVWAP
+  - Anchor on 52-week low    → Base AVWAP
+  - Anchor on recent swing-low → Pullback AVWAP
 
 Usage:
-    from martin_quant.anchors.avwap_anchor_manager import AVWAPAnchorManager
-
     mgr = AVWAPAnchorManager()
-    summary = mgr.get_summary(symbol="NVDA", df=nvda_df, earnings_date="2025-02-26")
-    print(summary.primary_avwap)
-    print(summary.is_support_confirmed)
+    result = mgr.compute(symbol, ohlcv_df, anchor_dates)
+    print(result.nearest_support)  # closest AVWAP below current price
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
-import logging
-import datetime
 
+import numpy as np
 import pandas as pd
-
-from martin_quant.anchors.avwap_anchor import (
-    AVWAPAnchor, AVWAPResult,
-    find_earnings_anchor, find_major_low_anchor,
-)
 
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
 @dataclass
-class AVWAPSummary:
-    """多錨點 AVWAP 整合摘要"""
+class AVWAPLine:
+    anchor_type: str          # "eps" | "breakout" | "base" | "swing_low" | "custom"
+    anchor_date: str          # YYYY-MM-DD
+    current_value: float      # AVWAP price as of latest bar
+    distance_pct: float       # (current_price - avwap) / avwap * 100  (+above / -below)
+    is_support: bool          # price > avwap (acting as support)
+    is_resistance: bool       # price < avwap (acting as resistance)
+    bars_since_anchor: int    # number of trading bars since anchor
+    slope_pct: float          # 20-bar slope of AVWAP (% per bar)
+
+
+@dataclass
+class AVWAPResult:
     symbol: str
-    primary_avwap: float                   # 最重要的 AVWAP（通常是 earnings）
-    primary_label: str
-    anchors: list[AVWAPResult] = field(default_factory=list)
+    current_price: float
+    avwap_lines: list[AVWAPLine] = field(default_factory=list)
+    nearest_support: Optional[AVWAPLine] = None    # closest AVWAP below price
+    nearest_resistance: Optional[AVWAPLine] = None # closest AVWAP above price
+    touching_support: bool = False   # within 0.5% of any support AVWAP
+    pullback_signal: bool = False    # price pulled back to AVWAP from above
+    breakout_signal: bool = False    # price broke above AVWAP after being below
+    score_boost: float = 0.0         # extra score for daily_scan integration
 
-    # 關鍵判斷
-    is_price_above_primary: bool = False
-    is_pulling_back_to_primary: bool = False
-    is_support_confirmed: bool = False      # 多條 AVWAP 匯聚 → 強支撐
-    confluence_zone: Optional[tuple[float, float]] = None  # (low, high) 支撐區
-    avwap_score: float = 0.0               # 0.0 ~ 1.0，進入 total_score 加分
+    def summary(self) -> str:
+        lines = [f"{self.symbol} @ {self.current_price:.2f}"]
+        for av in self.avwap_lines:
+            tag = "SUP" if av.is_support else "RES"
+            lines.append(
+                f"  [{tag}] {av.anchor_type:12s} AVWAP={av.current_value:.2f} "
+                f"dist={av.distance_pct:+.1f}% slope={av.slope_pct:+.3f}%/bar"
+            )
+        if self.touching_support:
+            lines.append("  ✅ TOUCHING SUPPORT AVWAP — pullback entry zone")
+        return "\n".join(lines)
 
-    def to_notes(self) -> str:
-        parts = []
-        for r in self.anchors:
-            if r.is_valid:
-                parts.append(
-                    f"AVWAP[{r.anchor_label}]={r.current_avwap:.2f}"
-                    f"({r.price_vs_avwap},{r.distance_pct:+.1f}%)"
-                )
-        return " | ".join(parts) if parts else "no_avwap"
 
+# ---------------------------------------------------------------------------
+# Core calculator
+# ---------------------------------------------------------------------------
+
+def _compute_avwap_series(df: pd.DataFrame, anchor_idx: int) -> pd.Series:
+    """Compute AVWAP from anchor_idx to end of df."""
+    sub = df.iloc[anchor_idx:].copy()
+    typical_price = (sub["high"] + sub["low"] + sub["close"]) / 3
+    pv = typical_price * sub["volume"]
+    cumvol = sub["volume"].cumsum()
+    cumpv  = pv.cumsum()
+    avwap  = cumpv / cumvol.replace(0, np.nan)
+    return avwap
+
+
+# ---------------------------------------------------------------------------
+# Manager
+# ---------------------------------------------------------------------------
 
 class AVWAPAnchorManager:
     """
-    為 DailyScanner 提供 AVWAP 多錨點支撐/阻力分析。
+    Manages multiple AVWAP anchors for a single symbol.
+
+    Auto-detects anchor dates if not provided:
+      - 52-week low  → base AVWAP
+      - Recent swing low (20-bar) → pullback AVWAP
 
     Parameters
     ----------
-    near_tolerance_pct : float
-        判斷「接近 AVWAP」的容忍範圍，預設 2.0%
-    confluence_gap_pct : float
-        多條 AVWAP 在此範圍內視為「匯聚」，預設 1.5%
+    touch_threshold_pct : float
+        Distance % to classify as "touching" support (default 0.5)
+    pullback_lookback : int
+        Bars to look back for swing-low anchor auto-detection
     """
 
     def __init__(
         self,
-        near_tolerance_pct: float = 2.0,
-        confluence_gap_pct: float = 1.5,
+        touch_threshold_pct: float = 0.5,
+        pullback_lookback: int = 20,
     ) -> None:
-        self.near_tolerance_pct = near_tolerance_pct
-        self.confluence_gap_pct = confluence_gap_pct
+        self.touch_pct   = touch_threshold_pct
+        self.pb_lookback = pullback_lookback
 
-    def get_summary(
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def compute(
         self,
         symbol: str,
         df: pd.DataFrame,
-        earnings_date: Optional[str] = None,
-        breakout_date: Optional[str] = None,
-        custom_anchors: Optional[dict[str, str]] = None,
-    ) -> AVWAPSummary:
+        anchor_dates: Optional[dict[str, str]] = None,
+    ) -> AVWAPResult:
         """
-        計算所有錨點的 AVWAP 並返回整合摘要。
+        Compute all AVWAP lines for the symbol.
 
         Parameters
         ----------
-        symbol : str
-        df : pd.DataFrame  OHLCV，DatetimeIndex
-        earnings_date : str  上季財報日期 'YYYY-MM-DD'（可選）
-        breakout_date : str  最近突破日期（可選）
-        custom_anchors : dict  {label: date_str}（可選）
+        df : DataFrame with columns [open, high, low, close, volume] indexed by date.
+        anchor_dates : dict  e.g.
+            {"eps": "2024-08-28", "breakout": "2024-07-15", "custom": "2024-11-01"}
         """
-        results: list[AVWAPResult] = []
+        df = df.copy()
+        df.columns = [c.lower() for c in df.columns]
+        if df.empty or len(df) < 5:
+            return AVWAPResult(symbol=symbol, current_price=0.0)
 
-        # 1. Earnings AVWAP
-        if earnings_date:
-            r = AVWAPAnchor(earnings_date, "earnings", self.near_tolerance_pct).calculate(df, symbol)
-            if r and r.is_valid:
-                results.append(r)
-        else:
-            # 嘗試自動偵測 earnings gap
-            auto_eps = find_earnings_anchor(df)
-            if auto_eps:
-                r = AVWAPAnchor(auto_eps, "earnings_auto", self.near_tolerance_pct).calculate(df, symbol)
-                if r and r.is_valid:
-                    results.append(r)
+        current_price = float(df["close"].iloc[-1])
+        anchor_map: dict[str, str] = anchor_dates or {}
 
-        # 2. Breakout AVWAP
-        if breakout_date:
-            r = AVWAPAnchor(breakout_date, "breakout", self.near_tolerance_pct).calculate(df, symbol)
-            if r and r.is_valid:
-                results.append(r)
+        # Auto-detect 52-week low anchor
+        if "base" not in anchor_map and len(df) >= 252:
+            lk = df.iloc[-252:]
+            min_idx = lk["low"].idxmin()
+            anchor_map["base"] = str(min_idx)[:10]
 
-        # 3. Major Low AVWAP (auto)
-        major_low_date = find_major_low_anchor(df)
-        if major_low_date:
-            r = AVWAPAnchor(major_low_date, "major_low", self.near_tolerance_pct).calculate(df, symbol)
-            if r and r.is_valid:
-                results.append(r)
+        # Auto-detect swing-low anchor
+        if "swing_low" not in anchor_map and len(df) >= self.pb_lookback:
+            recent = df.iloc[-self.pb_lookback:]
+            min_idx = recent["low"].idxmin()
+            anchor_map["swing_low"] = str(min_idx)[:10]
 
-        # 4. YTD AVWAP
-        ytd_date = f"{datetime.date.today().year}-01-01"
-        r = AVWAPAnchor(ytd_date, "ytd", self.near_tolerance_pct).calculate(df, symbol)
-        if r and r.is_valid:
-            results.append(r)
+        # Build AVWAP lines
+        avwap_lines: list[AVWAPLine] = []
+        df_dates = [str(d)[:10] for d in df.index]
 
-        # 5. Custom anchors
-        if custom_anchors:
-            for label, date_str in custom_anchors.items():
-                r = AVWAPAnchor(date_str, label, self.near_tolerance_pct).calculate(df, symbol)
-                if r and r.is_valid:
-                    results.append(r)
+        for anchor_type, anchor_date in anchor_map.items():
+            # Find anchor index
+            anchor_idx = None
+            for i, d in enumerate(df_dates):
+                if d >= anchor_date:
+                    anchor_idx = i
+                    break
+            if anchor_idx is None:
+                log.debug("%s: anchor_date %s not in df", symbol, anchor_date)
+                continue
+            if len(df) - anchor_idx < 3:
+                continue  # too few bars since anchor
 
-        if not results:
-            return AVWAPSummary(
-                symbol=symbol,
-                primary_avwap=0.0,
-                primary_label="none",
-                is_support_confirmed=False,
-                avwap_score=0.0,
-            )
+            avwap_series = _compute_avwap_series(df, anchor_idx)
+            if avwap_series.empty or avwap_series.isna().all():
+                continue
 
-        current_price = self._get_current_price(df)
+            av_val = float(avwap_series.iloc[-1])
+            if np.isnan(av_val) or av_val <= 0:
+                continue
 
-        # Primary = 最近錨點（bars_since_anchor 最少）
-        primary = min(results, key=lambda r: r.bars_since_anchor)
+            dist_pct = (current_price - av_val) / av_val * 100
+            bars_since = len(df) - anchor_idx
 
-        # Confluence check
-        valid_avwaps = [r.current_avwap for r in results if r.current_avwap > 0]
-        confluence_zone = self._find_confluence(valid_avwaps)
+            # Slope over last 20 bars of the AVWAP series
+            if len(avwap_series) >= 20:
+                slope_pct = float(
+                    (avwap_series.iloc[-1] - avwap_series.iloc[-20])
+                    / avwap_series.iloc[-20] * 100 / 20
+                )
+            else:
+                slope_pct = 0.0
 
-        # Support confirmed = price above primary AND near primary OR confluence
-        above_primary = current_price > primary.current_avwap
-        near_primary  = primary.is_price_near_avwap(current_price, self.near_tolerance_pct)
-        is_support = above_primary and (near_primary or confluence_zone is not None)
+            avwap_lines.append(AVWAPLine(
+                anchor_type=anchor_type,
+                anchor_date=anchor_date,
+                current_value=round(av_val, 4),
+                distance_pct=round(dist_pct, 3),
+                is_support=dist_pct >= 0,
+                is_resistance=dist_pct < 0,
+                bars_since_anchor=bars_since,
+                slope_pct=round(slope_pct, 4),
+            ))
 
-        # AVWAP score (0~1)
-        score = self._compute_score(
-            results, current_price, above_primary, near_primary, confluence_zone
+        # Sort by proximity (absolute distance)
+        avwap_lines.sort(key=lambda a: abs(a.distance_pct))
+
+        # Nearest support / resistance
+        supports    = [a for a in avwap_lines if a.is_support]
+        resistances = [a for a in avwap_lines if a.is_resistance]
+        nearest_sup = supports[0]   if supports    else None
+        nearest_res = resistances[0] if resistances else None
+
+        # Signals
+        touching = (
+            nearest_sup is not None
+            and abs(nearest_sup.distance_pct) <= self.touch_pct
         )
 
-        return AVWAPSummary(
+        # Pullback signal: price came from above, now touching AVWAP
+        pullback_signal = touching and nearest_sup is not None
+
+        # Breakout signal: price was below nearest resistance AVWAP, now above
+        breakout_signal = (
+            nearest_res is not None
+            and abs(nearest_res.distance_pct) <= 1.0
+            and current_price > nearest_res.current_value
+        )
+
+        # Score boost for daily_scan
+        score_boost = 0.0
+        if pullback_signal:
+            score_boost += 0.08
+        if breakout_signal:
+            score_boost += 0.06
+        if nearest_sup and 0 < nearest_sup.distance_pct <= 2.0 and nearest_sup.slope_pct > 0:
+            score_boost += 0.04  # price just above rising AVWAP
+
+        return AVWAPResult(
             symbol=symbol,
-            primary_avwap=primary.current_avwap,
-            primary_label=primary.anchor_label,
-            anchors=results,
-            is_price_above_primary=above_primary,
-            is_pulling_back_to_primary=primary.is_pulling_back_to_avwap(current_price, self.near_tolerance_pct),
-            is_support_confirmed=is_support,
-            confluence_zone=confluence_zone,
-            avwap_score=round(score, 3),
+            current_price=round(current_price, 4),
+            avwap_lines=avwap_lines,
+            nearest_support=nearest_sup,
+            nearest_resistance=nearest_res,
+            touching_support=touching,
+            pullback_signal=pullback_signal,
+            breakout_signal=breakout_signal,
+            score_boost=round(score_boost, 3),
         )
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _find_confluence(
+    def batch_compute(
         self,
-        avwap_values: list[float],
-    ) -> Optional[tuple[float, float]]:
-        """找出多條 AVWAP 匯聚區域"""
-        if len(avwap_values) < 2:
-            return None
-        avwap_values = sorted(avwap_values)
-        for i in range(len(avwap_values) - 1):
-            gap_pct = (avwap_values[i + 1] - avwap_values[i]) / avwap_values[i] * 100
-            if gap_pct <= self.confluence_gap_pct:
-                return (avwap_values[i], avwap_values[i + 1])
-        return None
-
-    @staticmethod
-    def _get_current_price(df: pd.DataFrame) -> float:
-        df_c = df.copy()
-        df_c.columns = [c.lower() for c in df_c.columns]
-        if "close" in df_c.columns and not df_c.empty:
-            return float(df_c["close"].iloc[-1])
-        return 0.0
-
-    def _compute_score(
-        self,
-        results: list[AVWAPResult],
-        current_price: float,
-        above_primary: bool,
-        near_primary: bool,
-        confluence_zone: Optional[tuple],
-    ) -> float:
-        """AVWAP 信號評分 0~1"""
-        score = 0.0
-        if above_primary:
-            score += 0.3
-        if near_primary:
-            score += 0.3
-        if confluence_zone is not None:
-            score += 0.2
-        # Bonus: multiple AVWAPs all below price (full support stack)
-        below_count = sum(1 for r in results if r.current_avwap < current_price)
-        if below_count >= 3:
-            score += 0.2
-        elif below_count == 2:
-            score += 0.1
-        return min(score, 1.0)
+        symbols: list[str],
+        ohlcv_map: dict[str, pd.DataFrame],
+        anchor_dates_map: Optional[dict[str, dict[str, str]]] = None,
+    ) -> dict[str, AVWAPResult]:
+        """Compute AVWAP for multiple symbols. Returns {symbol: AVWAPResult}."""
+        results: dict[str, AVWAPResult] = {}
+        for sym in symbols:
+            df = ohlcv_map.get(sym)
+            if df is None:
+                continue
+            anchors = (anchor_dates_map or {}).get(sym, {})
+            try:
+                results[sym] = self.compute(sym, df, anchors)
+            except Exception as e:
+                log.warning("AVWAP failed for %s: %s", sym, e)
+        return results
