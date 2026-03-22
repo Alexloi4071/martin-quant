@@ -20,6 +20,8 @@ def compute_true_range(
     tr_3 = (df[low_col] - prev_close).abs()
 
     tr = pd.concat([tr_1, tr_2, tr_3], axis=1).max(axis=1)
+    if not tr.empty:
+        tr.iloc[0] = pd.NA
     return tr.rename("true_range")
 
 

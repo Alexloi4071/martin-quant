@@ -1,0 +1,47 @@
+//@version=6
+indicator("ML Script A - Broad Attention Router", shorttitle="ML A Router", overlay=true, max_labels_count=200)
+
+mode = input.string("both", "Mode", options=["both", "long_only", "short_only"])
+emaLen = input.int(20, "Intraday EMA Length", minval=1)
+atrLen = input.int(14, "ATR Length", minval=1)
+rvolLookback = input.int(20, "RVOL Lookback", minval=1)
+rvolThreshold = input.float(1.2, "Minimum RVOL", minval=0.1, step=0.1)
+minRangeAtr = input.float(0.35, "Minimum Candle Range / ATR", minval=0.05, step=0.05)
+useVWAP = input.bool(true, "Require Session VWAP Alignment")
+requirePriorBarBreak = input.bool(true, "Require Prior Bar Break")
+showBackground = input.bool(true, "Show Attention Background")
+showLabels = input.bool(true, "Show Labels")
+
+emaValue = ta.ema(close, emaLen)
+vwapValue = ta.vwap(hlc3)
+atrValue = ta.atr(atrLen)
+volumeAvg = ta.sma(volume, rvolLookback)
+rvol = volumeAvg > 0 ? volume / volumeAvg : 0.0
+rangeAtr = atrValue > 0 ? (high - low) / atrValue : 0.0
+
+emaUp = emaValue > emaValue[1]
+emaDown = emaValue < emaValue[1]
+aboveVwap = not useVWAP or close > vwapValue
+belowVwap = not useVWAP or close < vwapValue
+bullExpand = close > open and rangeAtr >= minRangeAtr
+bearExpand = close < open and rangeAtr >= minRangeAtr
+priorHighBreak = not requirePriorBarBreak or close > high[1]
+priorLowBreak = not requirePriorBarBreak or close < low[1]
+
+longAttention = mode != "short_only" and close > emaValue and aboveVwap and emaUp and rvol >= rvolThreshold and bullExpand and priorHighBreak
+shortAttention = mode != "long_only" and close < emaValue and belowVwap and emaDown and rvol >= rvolThreshold and bearExpand and priorLowBreak
+
+freshLongAttention = longAttention and not longAttention[1]
+freshShortAttention = shortAttention and not shortAttention[1]
+
+plot(emaValue, "Intraday EMA", color=color.orange, linewidth=2)
+plot(useVWAP ? vwapValue : na, "Session VWAP", color=color.aqua, linewidth=2)
+
+bgcolor(showBackground and longAttention ? color.new(color.green, 88) : na)
+bgcolor(showBackground and shortAttention ? color.new(color.red, 88) : na)
+
+plotshape(freshLongAttention, title="ML_LONG_ATTENTION", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), textcolor=color.white, text="LONG A", size=size.tiny, display=showLabels ? display.all : display.none)
+plotshape(freshShortAttention, title="ML_SHORT_ATTENTION", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), textcolor=color.white, text="SHORT A", size=size.tiny, display=showLabels ? display.all : display.none)
+
+alertcondition(freshLongAttention, title="ML_LONG_ATTENTION", message="ML_LONG_ATTENTION")
+alertcondition(freshShortAttention, title="ML_SHORT_ATTENTION", message="ML_SHORT_ATTENTION")

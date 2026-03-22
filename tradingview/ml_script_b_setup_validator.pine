@@ -1,0 +1,57 @@
+//@version=6
+indicator("ML Script B - Setup Validator", shorttitle="ML B Validator", overlay=true, max_labels_count=200)
+
+mode = input.string("both", "Mode", options=["both", "long_only", "short_only"])
+dailyTf = input.timeframe("D", "Daily Timeframe")
+hourlyTf = input.timeframe("60", "Hourly Timeframe")
+useHourlyFilter = input.bool(true, "Use Hourly Context Filter")
+showBackground = input.bool(true, "Show Validation Background")
+showMarkers = input.bool(true, "Show Validation Markers")
+
+longLookbackHigh = input.int(20, "Long Pullback High Lookback", minval=5)
+longMinPullbackPct = input.float(5.0, "Long Minimum Pullback %", minval=0.1, step=0.1)
+longMaxPullbackPct = input.float(30.0, "Long Maximum Pullback %", minval=0.1, step=0.1)
+longMaxSupportDistancePct = input.float(3.0, "Long Max Support Distance %", minval=0.1, step=0.1)
+
+shortMaxBounceDistancePct = input.float(3.0, "Short Max Bounce Distance %", minval=0.1, step=0.1)
+shortSlopeLookback = input.int(5, "Short EMA21 Slope Lookback", minval=1)
+
+[dClose, dHigh] = request.security(syminfo.tickerid, dailyTf, [close, high], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+dEma9 = request.security(syminfo.tickerid, dailyTf, ta.ema(close, 9), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+dEma21 = request.security(syminfo.tickerid, dailyTf, ta.ema(close, 21), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+dEma50 = request.security(syminfo.tickerid, dailyTf, ta.ema(close, 50), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+dRecentHigh = request.security(syminfo.tickerid, dailyTf, ta.highest(high, longLookbackHigh), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+dEma21Past = request.security(syminfo.tickerid, dailyTf, ta.ema(close, 21)[shortSlopeLookback], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+hClose = request.security(syminfo.tickerid, hourlyTf, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+hHigh = request.security(syminfo.tickerid, hourlyTf, high, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+hLow = request.security(syminfo.tickerid, hourlyTf, low, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+hEma21 = request.security(syminfo.tickerid, hourlyTf, ta.ema(close, 21), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+longPullbackDepthPct = dRecentHigh > 0 ? (dRecentHigh - dClose) / dRecentHigh * 100.0 : na
+longSupport = math.abs(dClose - dEma21) <= math.abs(dClose - dEma50) ? dEma21 : dEma50
+longSupportDistancePct = longSupport > 0 ? math.abs(dClose - longSupport) / longSupport * 100.0 : na
+
+shortBounceDistancePct = dEma9 > 0 ? (dEma9 - dClose) / dEma9 * 100.0 : na
+shortDailyTrendWeak = dEma21 < dEma21Past
+hourlyLongOk = hClose > hEma21 and hEma21 >= hEma21[1]
+hourlyShortOk = hClose < hEma21 and hEma21 <= hEma21[1] and hHigh <= hHigh[1]
+
+longSetupValid = mode != "short_only" and dEma9 > dEma21 and dEma21 > dEma50 and dClose > dEma50 and longPullbackDepthPct >= longMinPullbackPct and longPullbackDepthPct <= longMaxPullbackPct and longSupportDistancePct <= longMaxSupportDistancePct and (not useHourlyFilter or hourlyLongOk)
+shortSetupValid = mode != "long_only" and dEma9 < dEma21 and dEma21 < dEma50 and dClose < dEma9 and shortBounceDistancePct >= 0 and shortBounceDistancePct <= shortMaxBounceDistancePct and shortDailyTrendWeak and (not useHourlyFilter or hourlyShortOk)
+
+freshLongSetup = longSetupValid and not longSetupValid[1]
+freshShortSetup = shortSetupValid and not shortSetupValid[1]
+
+plot(dEma21, "Daily EMA21", color=color.teal, linewidth=2)
+plot(dEma50, "Daily EMA50", color=color.blue, linewidth=2)
+plot(dEma9, "Daily EMA9", color=color.orange, linewidth=1)
+
+bgcolor(showBackground and longSetupValid ? color.new(color.green, 90) : na)
+bgcolor(showBackground and shortSetupValid ? color.new(color.red, 90) : na)
+
+plotshape(freshLongSetup, title="ML_LONG_SETUP_VALID", style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), textcolor=color.white, text="LONG B", size=size.tiny, display=showMarkers ? display.all : display.none)
+plotshape(freshShortSetup, title="ML_SHORT_SETUP_VALID", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), textcolor=color.white, text="SHORT B", size=size.tiny, display=showMarkers ? display.all : display.none)
+
+alertcondition(freshLongSetup, title="ML_LONG_SETUP_VALID", message="ML_LONG_SETUP_VALID")
+alertcondition(freshShortSetup, title="ML_SHORT_SETUP_VALID", message="ML_SHORT_SETUP_VALID")

@@ -124,28 +124,47 @@ def add_ema_stack_state(
     trend: int = 150,
 ) -> pd.DataFrame:
     """
-    Add boolean columns:
-      ema_bull_stack      : fast > mid > slow  (fully aligned up)
-      ema_bear_stack      : fast < mid < slow  (fully aligned down)
-      ema_above_150       : close > ema_150  (long-term uptrend)
-      ema_bull_full       : bull_stack AND close > ema_150 (Martin's ideal long)
+    Add boolean columns describing EMA stack alignment.
 
-    Returns a copy.
+    The canonical Martin Luk stack is 9 / 21 / 50 / 150, but older callers
+    and tests still pass frames with 9 / 20 / 50 only. This helper accepts the
+    canonical columns when available and falls back to the older 20 EMA and,
+    if needed, the slow EMA for the long-trend check.
     """
     out = df.copy()
-    for span in (fast, mid, slow, trend):
-        if f"ema_{span}" not in out.columns:
-            raise KeyError(
-                f"ema_{span} not found. Run add_ema_features with spans including "
-                f"({fast}, {mid}, {slow}, {trend})."
-            )
-    f_col = out[f"ema_{fast}"]
-    m_col = out[f"ema_{mid}"]
-    s_col = out[f"ema_{slow}"]
-    t_col = out[f"ema_{trend}"]
+    if "close" not in out.columns:
+        raise KeyError("'close' not found. add_ema_stack_state requires a close column.")
+
+    def _pick_col(primary: int, *fallbacks: int) -> str:
+        for span in (primary, *fallbacks):
+            col = f"ema_{span}"
+            if col in out.columns:
+                return col
+        wanted = ", ".join(str(span) for span in (primary, *fallbacks))
+        raise KeyError(f"Missing EMA column. Expected one of: {wanted}.")
+
+    fast_name = _pick_col(fast)
+    mid_name = _pick_col(mid, 20 if mid == 21 else mid)
+    slow_name = _pick_col(slow)
+
+    trend_name = None
+    for span in (trend, 200, slow):
+        col = f"ema_{span}"
+        if col in out.columns:
+            trend_name = col
+            break
+
+    f_col = out[fast_name]
+    m_col = out[mid_name]
+    s_col = out[slow_name]
 
     out["ema_bull_stack"] = (f_col > m_col) & (m_col > s_col)
     out["ema_bear_stack"] = (f_col < m_col) & (m_col < s_col)
-    out["ema_above_150"]  = out["close"] > t_col
-    out["ema_bull_full"]  = out["ema_bull_stack"] & out["ema_above_150"]
+
+    if trend_name is not None:
+        out["ema_above_150"] = out["close"] > out[trend_name]
+    else:
+        out["ema_above_150"] = False
+
+    out["ema_bull_full"] = out["ema_bull_stack"] & out["ema_above_150"]
     return out

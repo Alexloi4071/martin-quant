@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,7 +10,7 @@ from martin_quant.core.datatypes import TriggerSignal
 from martin_quant.features.ema import compute_ema
 
 
-@dataclass(slots=True)
+@dataclass(**({"slots": True} if sys.version_info >= (3, 10) else {}))
 class TradeSimulatorConfig:
     max_holding_days: int = 20
     trail_mode: str = "ema9"   # ema9 | none

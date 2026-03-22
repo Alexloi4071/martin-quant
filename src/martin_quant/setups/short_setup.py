@@ -1,88 +1,36 @@
-"""short_setup.py
+﻿from __future__ import annotations
 
-做空 Setup 辨識 — Martin 影片 1:14:53 – 1:50:12
-
-做空條件:
-  1. 日線 EMA 空頭排列 (EMA9 < EMA20 < EMA50)
-  2. 股價在 EMA9 下方 (close < ema9)
-  3. 週線 EMA 也是空頭 (via WeeklyContext)
-  4. 最近一根大陰線或 bearish engulfing (觸發確認)
-  5. 反彈到 EMA9 或 intraday resistance 附近 → 入空
-  6. Stop: 收在 EMA20 之上 or 過前日高點
-
-注意: 做空只在 MarketRegime != BULL 時執行 (Martin 原則)
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
-from martin_quant.core.enums import SetupType
 from martin_quant.core.datatypes import SetupSignal
+from martin_quant.core.enums import SetupType
+from martin_quant.features.candlestick import detect_engulfing_bear, detect_inside_day, detect_nr7
 from martin_quant.features.ema import add_ema_features
-from martin_quant.features.candlestick import (
-    detect_engulfing_bear,
-    detect_inside_day,
-    detect_nr7,
-)
+from martin_quant.features.weekly_context import WeeklyContext
 
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 @dataclass
 class ShortSetupConfig:
     ema_fast: int = 9
-    ema_mid: int  = 20
+    ema_mid: int = 21
     ema_slow: int = 50
-
-    # Distance from EMA9 to call it a "bounce into resistance"
-    max_bounce_dist_pct: float = 3.0   # close within 3% below ema9
-
-    # Confirmation: require bearish candlestick on signal bar
+    max_bounce_dist_pct: float = 3.0
     require_bearish_candle: bool = True
-
-    # RS filter: stock must be weaker than SPY (negative relative perf)
-    require_negative_rs: bool = False   # optional — needs RS data
-
-    # Minimum EMA decline slope (ema20 must be falling)
-    require_ema20_declining: bool = True
-    ema20_slope_lookback: int = 5       # bars to measure slope
-
-    # Risk: stop above EMA20
-    stop_buffer_pct: float = 0.5        # stop = ema20 * (1 + stop_buffer_pct%)
-
-    # Target: 1:2 default R/R
+    require_negative_rs: bool = False
+    require_ema_mid_declining: bool = True
+    ema_mid_slope_lookback: int = 5
+    stop_buffer_pct: float = 0.5
     min_rr_ratio: float = 2.0
-
     min_history_bars: int = 60
     min_score: float = 0.3
+    require_weekly_context: bool = False
+    require_weekly_bear_for_short: bool = False
 
-
-# ---------------------------------------------------------------------------
-# Detector
-# ---------------------------------------------------------------------------
 
 class ShortSetupDetector:
-    """
-    Scans daily OHLCV for short setup candidates.
-
-    A setup is valid when:
-      - Daily EMA bear stack (9 < 20 < 50)
-      - Close is below EMA9 but bouncing toward it (within max_bounce_dist_pct)
-      - EMA20 has been declining over the past N bars
-      - Optional: bearish candle pattern on the signal bar
-
-    Entry logic:
-      - Short entry = current close (or next open)
-      - Stop       = EMA20 + buffer%
-      - Target     = entry - (stop - entry) * min_rr_ratio
-    """
-
     def __init__(self, config: Optional[ShortSetupConfig] = None) -> None:
         self.config = config or ShortSetupConfig()
 
@@ -90,131 +38,141 @@ class ShortSetupDetector:
         self,
         symbol: str,
         df: pd.DataFrame,
-        weekly_bear: bool = False,   # pass WeeklyContext.ema_bear_stack
+        weekly_bear: bool = False,
+        weekly_context: Optional[WeeklyContext] = None,
     ) -> Optional[SetupSignal]:
-        """
-        Returns SetupSignal if a short setup is detected on the last bar,
-        else None.
-        """
         cfg = self.config
         if len(df) < cfg.min_history_bars:
             return None
+        if cfg.require_weekly_context and weekly_context is None:
+            return None
 
+        weekly_bear_active = weekly_bear or (weekly_context.is_short_favourable() if weekly_context is not None else False)
+        if cfg.require_weekly_bear_for_short and not weekly_bear_active:
+            return None
+
+        df = self._normalize(df)
         df = add_ema_features(df, spans=(cfg.ema_fast, cfg.ema_mid, cfg.ema_slow))
         last = df.iloc[-1]
 
-        ema9  = last.get(f"ema_{cfg.ema_fast}")
-        ema20 = last.get(f"ema_{cfg.ema_mid}")
+        ema9 = last.get(f"ema_{cfg.ema_fast}")
+        ema21 = last.get(f"ema_{cfg.ema_mid}")
         ema50 = last.get(f"ema_{cfg.ema_slow}")
-        close = last["close"]
-
-        if any(pd.isna([ema9, ema20, ema50])):
+        close = last.get("close")
+        if any(pd.isna([ema9, ema21, ema50, close])):
             return None
-
-        # 1. Bear EMA stack
-        if not (ema9 < ema20 < ema50):
+        if not (ema9 < ema21 < ema50):
             return None
-
-        # 2. Close below EMA9
         if close >= ema9:
             return None
 
-        # 3. Close within bounce zone (not too far below ema9)
         dist_pct = (ema9 - close) / ema9 * 100
         if dist_pct > cfg.max_bounce_dist_pct:
             return None
-
-        # 4. EMA20 slope declining
-        if cfg.require_ema20_declining:
-            ema20_series = df[f"ema_{cfg.ema_mid}"].tail(cfg.ema20_slope_lookback)
-            if ema20_series.iloc[-1] >= ema20_series.iloc[0]:
+        if cfg.require_ema_mid_declining:
+            ema_mid_series = df[f"ema_{cfg.ema_mid}"].tail(cfg.ema_mid_slope_lookback)
+            if len(ema_mid_series) < cfg.ema_mid_slope_lookback or ema_mid_series.iloc[-1] >= ema_mid_series.iloc[0]:
                 return None
 
-        # 5. Optional bearish candle
-        score = 0.4   # base score for bear stack + bounce
+        score = 0.4
+        candle_tags: list[str] = []
         if cfg.require_bearish_candle:
-            engulf = detect_engulfing_bear(df).iloc[-1]
-            inside = detect_inside_day(df).iloc[-1]
-            nr7    = detect_nr7(df).iloc[-1]
+            engulf = bool(detect_engulfing_bear(df).iloc[-1])
+            inside = bool(detect_inside_day(df).iloc[-1])
+            nr7 = bool(detect_nr7(df).iloc[-1])
             if engulf:
                 score += 0.3
+                candle_tags.append("bearish_engulfing")
             elif inside or nr7:
                 score += 0.2
+                candle_tags.append("inside_or_nr7")
             else:
-                return None  # require some pattern
+                return None
         else:
             score += 0.2
 
-        # 6. Weekly confirmation bonus
-        if weekly_bear:
+        if weekly_bear_active:
             score += 0.2
-
         if score < cfg.min_score:
             return None
 
-        # --- Levels ---
-        entry_price = close
-        stop_price  = ema20 * (1 + cfg.stop_buffer_pct / 100)
+        entry_price = float(close)
+        stop_price = float(ema21) * (1 + cfg.stop_buffer_pct / 100)
         risk_per_share = stop_price - entry_price
         if risk_per_share <= 0:
             return None
-
         target_price = entry_price - risk_per_share * cfg.min_rr_ratio
         if target_price <= 0:
             return None
 
+        timestamp = last.get("timestamp", df["timestamp"].iloc[-1])
+        notes = [
+            f"Bear EMA stack {cfg.ema_fast}<{cfg.ema_mid}<{cfg.ema_slow}",
+            f"Bounce into EMA{cfg.ema_fast} resistance at {dist_pct:.1f}% below",
+        ]
+        if weekly_bear_active:
+            notes.append("Weekly bear context confirmed")
+        if weekly_context is not None:
+            notes.append(f"Weekly context: {weekly_context.trend_state}, close_strength={weekly_context.close_strength:.2f}")
+        notes.extend(candle_tags)
+
+        context = {
+            "ema_fast": round(float(ema9), 4),
+            "ema_mid": round(float(ema21), 4),
+            "ema_slow": round(float(ema50), 4),
+            "bounce_distance_pct": round(float(dist_pct), 2),
+            "weekly_bear": weekly_bear_active,
+            "weekly_trend_state": weekly_context.trend_state if weekly_context else None,
+            "weekly_close_strength": round(weekly_context.close_strength, 3) if weekly_context else None,
+            "candle_tags": candle_tags,
+        }
+
         return SetupSignal(
             symbol=symbol,
-            setup_type=SetupType.BREAKDOWN,     # short breakdown
-            score=round(min(score, 1.0), 3),
-            entry_price=round(float(entry_price), 4),
-            stop_price=round(float(stop_price), 4),
-            target_price=round(float(target_price), 4),
-            support_level=None,
-            resistance_level=round(float(ema9), 4),  # EMA9 = short-side resistance
-            invalidation_level=round(float(stop_price), 4),
+            setup_type=SetupType.SHORT_RESISTANCE_REVERSAL,
+            timestamp=timestamp,
+            timeframe="1d",
             direction="short",
-            notes=(
-                f"Bear stack: EMA{cfg.ema_fast}={ema9:.2f} < "
-                f"EMA{cfg.ema_mid}={ema20:.2f} < "
-                f"EMA{cfg.ema_slow}={ema50:.2f}. "
-                f"Bounce dist={dist_pct:.1f}%."
-            ),
+            score=round(min(score, 1.0), 3),
+            entry_price=round(entry_price, 4),
+            stop_price=round(stop_price, 4),
+            target_price=round(float(target_price), 4),
+            invalidation_level=round(stop_price, 4),
+            resistance_level=round(float(ema9), 4),
+            context=context,
+            notes=notes,
         )
+
+    @staticmethod
+    def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        if "timestamp" not in out.columns:
+            out = out.reset_index().rename(columns={out.index.name or "index": "timestamp"})
+        return out.sort_values("timestamp").reset_index(drop=True)
 
     def scan_universe(
         self,
         symbols: list[str],
         ohlcv_map: dict[str, pd.DataFrame],
         weekly_bear_map: Optional[dict[str, bool]] = None,
+        weekly_context_map: Optional[dict[str, WeeklyContext]] = None,
     ) -> list[SetupSignal]:
-        """
-        Scan all symbols and return valid short setups sorted by score desc.
-
-        Parameters
-        ----------
-        symbols : list[str]
-        ohlcv_map : dict[str, pd.DataFrame]
-            Daily OHLCV for each symbol.
-        weekly_bear_map : dict[str, bool], optional
-            Pre-computed {symbol: weekly_context.ema_bear_stack}.
-        """
         results: list[SetupSignal] = []
-        wbm = weekly_bear_map or {}
-
-        for sym in symbols:
-            df = ohlcv_map.get(sym)
+        weekly_map = weekly_bear_map or {}
+        weekly_ctx_map = weekly_context_map or {}
+        for symbol in symbols:
+            df = ohlcv_map.get(symbol)
             if df is None:
                 continue
             try:
-                sig = self.detect(
-                    symbol=sym,
+                signal = self.detect(
+                    symbol=symbol,
                     df=df,
-                    weekly_bear=wbm.get(sym, False),
+                    weekly_bear=weekly_map.get(symbol, False),
+                    weekly_context=weekly_ctx_map.get(symbol),
                 )
-                if sig is not None:
-                    results.append(sig)
             except Exception:
                 continue
-
-        return sorted(results, key=lambda s: s.score, reverse=True)
+            if signal is not None:
+                results.append(signal)
+        return sorted(results, key=lambda item: item.score, reverse=True)

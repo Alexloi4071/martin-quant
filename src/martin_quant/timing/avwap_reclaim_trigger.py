@@ -10,7 +10,7 @@ from martin_quant.core.enums import SetupType, TriggerType
 from martin_quant.features.ema import compute_ema
 
 
-@dataclass(slots=True)
+@dataclass
 class AvwapReclaimConfig:
     max_entry_bars: int = 12
     min_trigger_rvol: float = 1.2
@@ -169,3 +169,4 @@ class AvwapReclaimTrigger:
             if sig is not None:
                 results.append(sig)
         return sorted(results, key=lambda s: s.score, reverse=True)
+

@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 import pandas as pd
 
 
-@dataclass(slots=True)
+@dataclass
 class FinnhubProviderConfig:
     api_key: str = ""
     api_key_env: str = "FINNHUB_API_KEY"
@@ -181,4 +181,13 @@ class FinnhubProvider:
             (root / tf).mkdir(parents=True, exist_ok=True)
         for tf, df in frames.items():
             if df is not None and not df.empty:
-                df.to_parquet(root / tf / f"{symbol.upper()}.parquet", index=False)
+                final_path = root / tf / f"{symbol.upper()}.parquet"
+                temp_path = final_path.with_name(f".{final_path.name}.{os.getpid()}.tmp")
+                try:
+                    df.to_parquet(temp_path, index=False)
+                    os.replace(temp_path, final_path)
+                finally:
+                    if temp_path.exists():
+                        temp_path.unlink(missing_ok=True)
+
+

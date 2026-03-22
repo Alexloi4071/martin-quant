@@ -1,17 +1,3 @@
-"""equity_curve_sizer.py
-
-動態倉位管理 — Equity Curve Feedback
-
-Martin 影片 1:55:03 核心規則:
-  - 連續虧損 N 次 → 自動縮小 per_trade_risk_pct
-  - Equity curve 低於 N 日均線 → 防禦模式
-  - 恢復盈利 → 逐步恢復正常倉位
-  - 大盤弱 + 自己虧損 → 立即縮倉 (double penalty)
-
-設計:
-  EquityCurveSizer 包裝 PositionSizer，
-  根據 trade history 自動調整 per_trade_risk_pct。
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -20,60 +6,63 @@ from typing import Optional
 import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
 @dataclass
 class EquityCurveSizerConfig:
-    # Base risk
-    base_risk_pct: float = 0.5         # 正常狀態每筆風險佔總資產 %
-    min_risk_pct: float = 0.1          # 最低風險下限 (防禦模式)
-    max_risk_pct: float = 1.0          # 最高風險上限 (順風加倉)
+    base_risk_pct: float = 0.5
+    min_risk_pct: float = 0.1
+    max_risk_pct: float = 1.0
 
-    # Drawdown triggers
-    consecutive_loss_reduce: int = 3   # 連虧 N 筆觸發縮倉
-    consecutive_loss_halt:   int = 6   # 連虧 N 筆觸發暫停新倉
-    reduce_factor: float = 0.5         # 縮倉倍數 (e.g. 0.5% → 0.25%)
+    consecutive_loss_reduce: int = 3
+    consecutive_loss_halt: int = 6
+    reduce_factor: float = 0.5
 
-    # Equity curve MA
-    equity_ma_window: int = 10         # 過去 N 筆交易 equity 的均線
-    below_ma_reduce: bool = True       # equity 低於均線時縮倉
-    below_ma_factor: float = 0.7       # 低於均線時倍數
+    equity_ma_window: int = 10
+    below_ma_reduce: bool = True
+    below_ma_factor: float = 0.7
 
-    # Recovery
-    recovery_consecutive_wins: int = 3 # 連贏 N 筆才恢復正常倉位
+    recovery_consecutive_wins: int = 3
+    market_bear_extra_reduce: float = 0.7
+    bull_boost_pct: float = 0.0
 
-    # Market regime penalty
-    market_bear_extra_reduce: float = 0.7  # 大盤熊市時再乘以此因子
+    # Backward-compatible aliases expected by older tests/callers.
+    reduced_risk_pct: Optional[float] = None
+    consecutive_loss_threshold: Optional[int] = None
+    equity_ma_period: Optional[int] = None
 
+    def __post_init__(self) -> None:
+        if self.consecutive_loss_threshold is not None:
+            self.consecutive_loss_reduce = int(self.consecutive_loss_threshold)
+        if self.equity_ma_period is not None:
+            self.equity_ma_window = int(self.equity_ma_period)
+        if self.reduced_risk_pct is not None:
+            if self.base_risk_pct <= 0:
+                self.reduce_factor = 0.0
+            else:
+                self.reduce_factor = max(0.0, float(self.reduced_risk_pct) / float(self.base_risk_pct))
 
-# ---------------------------------------------------------------------------
-# State tracker
-# ---------------------------------------------------------------------------
 
 @dataclass
 class EquityCurveState:
     equity_history: list[float] = field(default_factory=list)
-    pnl_history:    list[float] = field(default_factory=list)   # per-trade PnL
-    r_history:      list[float] = field(default_factory=list)   # per-trade R multiple
+    pnl_history: list[float] = field(default_factory=list)
+    r_history: list[float] = field(default_factory=list)
     consecutive_losses: int = 0
-    consecutive_wins:   int = 0
+    consecutive_wins: int = 0
     halted: bool = False
     current_risk_pct: float = 0.5
 
     def update(self, trade_pnl: float, trade_r: float, equity_after: float) -> None:
-        self.equity_history.append(equity_after)
-        self.pnl_history.append(trade_pnl)
-        self.r_history.append(trade_r)
+        self.equity_history.append(float(equity_after))
+        self.pnl_history.append(float(trade_pnl))
+        self.r_history.append(float(trade_r))
 
         if trade_r >= 0:
-            self.consecutive_wins  += 1
+            self.consecutive_wins += 1
             self.consecutive_losses = 0
             self.halted = False
         else:
             self.consecutive_losses += 1
-            self.consecutive_wins   = 0
+            self.consecutive_wins = 0
 
     @property
     def equity_ma(self) -> Optional[float]:
@@ -91,124 +80,107 @@ class EquityCurveState:
         return self.current_equity < self.equity_ma
 
 
-# ---------------------------------------------------------------------------
-# Main sizer
-# ---------------------------------------------------------------------------
-
 class EquityCurveSizer:
-    """
-    Wraps a base risk_pct and dynamically adjusts it based on recent
-    trade history and equity curve performance.
-
-    Usage:
-        sizer = EquityCurveSizer()
-        risk_pct = sizer.get_risk_pct(equity=100_000, market_regime="bull")
-        # ... after trade closes:
-        sizer.record_trade(pnl=500, r_multiple=2.5, equity_after=100_500)
-    """
-
-    def __init__(self, config: Optional[EquityCurveSizerConfig] = None) -> None:
-        self.config = config or EquityCurveSizerConfig()
-        self.state  = EquityCurveState(
-            current_risk_pct=self.config.base_risk_pct
-        )
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def get_risk_pct(
+    def __init__(
         self,
-        equity: float,
-        market_regime: str = "bull",  # "bull" | "neutral" | "bear"
-    ) -> float:
-        """
-        Return the current per-trade risk % to use for position sizing.
+        initial_equity: Optional[float] = None,
+        config: Optional[EquityCurveSizerConfig] = None,
+    ) -> None:
+        self.config = config or EquityCurveSizerConfig()
+        self.state = EquityCurveState(current_risk_pct=self.config.base_risk_pct)
+        if initial_equity is not None:
+            self.state.equity_history.append(float(initial_equity))
 
-        Parameters
-        ----------
-        equity : float
-            Current portfolio equity.
-        market_regime : str
-            Market condition from MarketRegimeFilter.
+    def _equity_ma(self) -> Optional[float]:
+        history = self.state.equity_history
+        if len(history) < 2:
+            return None
+        window = max(1, int(self.config.equity_ma_window))
+        return float(np.mean(history[-window:]))
 
-        Returns
-        -------
-        float
-            Adjusted risk_pct, clamped to [min_risk_pct, max_risk_pct].
-        """
+    def _is_below_equity_ma(self, equity: float) -> bool:
+        equity_ma = self._equity_ma()
+        if equity_ma is None:
+            return False
+        return float(equity) < equity_ma
+
+    def get_risk_pct(self, equity: float, market_regime: str = "bull") -> float:
         cfg = self.config
-        st  = self.state
+        st = self.state
 
         if st.halted:
             return 0.0
 
         risk = cfg.base_risk_pct
+        if market_regime == "bull" and cfg.bull_boost_pct:
+            risk += cfg.bull_boost_pct
 
-        # 1. Consecutive loss penalty
         if st.consecutive_losses >= cfg.consecutive_loss_halt:
             st.halted = True
+            st.current_risk_pct = 0.0
             return 0.0
-        elif st.consecutive_losses >= cfg.consecutive_loss_reduce:
-            risk *= cfg.reduce_factor
+        if st.consecutive_losses >= cfg.consecutive_loss_reduce:
+            if cfg.reduced_risk_pct is not None:
+                risk = float(cfg.reduced_risk_pct)
+            else:
+                risk *= cfg.reduce_factor
 
-        # 2. Equity below MA penalty
-        if cfg.below_ma_reduce and st.is_below_equity_ma():
+        if cfg.below_ma_reduce and self._is_below_equity_ma(equity):
             risk *= cfg.below_ma_factor
 
-        # 3. Market regime penalty
         if market_regime == "bear":
             risk *= cfg.market_bear_extra_reduce
 
-        # 4. Recovery bonus (restore after winning streak)
         if st.consecutive_wins >= cfg.recovery_consecutive_wins:
-            risk = cfg.base_risk_pct  # fully restored
+            risk = cfg.base_risk_pct + (cfg.bull_boost_pct if market_regime == "bull" else 0.0)
 
-        # Clamp
         risk = max(cfg.min_risk_pct, min(cfg.max_risk_pct, risk))
         st.current_risk_pct = risk
         return risk
 
-    def record_trade(
-        self,
-        pnl: float,
-        r_multiple: float,
-        equity_after: float,
-    ) -> None:
-        """
-        Call after each trade closes to update the internal state.
+    def record_trade(self, *args, **kwargs) -> None:
+        if len(args) == 3 and not kwargs:
+            pnl, r_multiple, equity_after = args
+        elif {"pnl", "r_multiple", "equity_after"}.issubset(kwargs):
+            pnl = kwargs["pnl"]
+            r_multiple = kwargs["r_multiple"]
+            equity_after = kwargs["equity_after"]
+        elif (len(args) == 1 and "won" in kwargs) or len(args) == 2:
+            equity_after = args[0]
+            won = args[1] if len(args) == 2 else kwargs["won"]
+            previous_equity = self.state.current_equity
+            pnl = float(equity_after) - float(previous_equity) if previous_equity is not None else 0.0
+            r_multiple = kwargs.get("r_multiple", 1.0 if won else -1.0)
+        else:
+            raise TypeError(
+                "record_trade expects either (pnl, r_multiple, equity_after), "
+                "keyword args pnl=/r_multiple=/equity_after=, or legacy "
+                "(equity_after, won=...) usage."
+            )
 
-        Parameters
-        ----------
-        pnl : float
-            Realised PnL in dollar terms.
-        r_multiple : float
-            Trade result in R (positive = win, negative = loss).
-        equity_after : float
-            Portfolio equity after the trade.
-        """
         self.state.update(
-            trade_pnl=pnl,
-            trade_r=r_multiple,
-            equity_after=equity_after,
+            trade_pnl=float(pnl),
+            trade_r=float(r_multiple),
+            equity_after=float(equity_after),
         )
 
     def summary(self) -> dict:
-        st  = self.state
-        cfg = self.config
+        st = self.state
+        equity_ma = self._equity_ma()
+        current_equity = st.current_equity
         return {
-            "current_risk_pct":      st.current_risk_pct,
-            "consecutive_losses":    st.consecutive_losses,
-            "consecutive_wins":      st.consecutive_wins,
-            "halted":                st.halted,
-            "equity_ma":             round(st.equity_ma, 2) if st.equity_ma else None,
-            "current_equity":        st.current_equity,
-            "below_equity_ma":       st.is_below_equity_ma(),
+            "current_risk_pct": st.current_risk_pct,
+            "consecutive_losses": st.consecutive_losses,
+            "consecutive_wins": st.consecutive_wins,
+            "halted": st.halted,
+            "equity_ma": round(equity_ma, 2) if equity_ma is not None else None,
+            "current_equity": current_equity,
+            "below_equity_ma": self._is_below_equity_ma(current_equity) if current_equity is not None else False,
             "total_trades_recorded": len(st.r_history),
         }
 
     def reset(self) -> None:
-        """Full reset — use at start of new trading period."""
-        self.state = EquityCurveState(
-            current_risk_pct=self.config.base_risk_pct
-        )
+        initial_equity = self.state.equity_history[0] if self.state.equity_history else None
+        self.state = EquityCurveState(current_risk_pct=self.config.base_risk_pct)
+        if initial_equity is not None:
+            self.state.equity_history.append(float(initial_equity))

@@ -1,0 +1,81 @@
+//@version=6
+indicator("ML Script C1 - Short Prev Hour Low Break", shorttitle="ML C1 Short", overlay=true, max_labels_count=200)
+
+dailyTf = input.timeframe("D", "Daily Timeframe")
+hourlyTf = input.timeframe("60", "Hourly Timeframe")
+intradayEmaLen = input.int(20, "Intraday EMA Length", minval=1)
+atrLen = input.int(14, "ATR Length", minval=1)
+minRangeAtr = input.float(0.25, "Minimum Trigger Bar Range / ATR", minval=0.05, step=0.05)
+useDailyShortGate = input.bool(true, "Require Daily Short Structure")
+useHourlyShortGate = input.bool(true, "Require Hourly Weak Structure")
+useVwapGate = input.bool(true, "Require Close Below VWAP")
+useIntradayEmaGate = input.bool(true, "Require Close Below Intraday EMA")
+requireRedBar = input.bool(true, "Require Red Trigger Bar")
+showLevels = input.bool(true, "Show Prior Hour Low")
+showBackground = input.bool(true, "Show Trigger Background")
+showMarkers = input.bool(true, "Show Trigger Markers")
+
+sessionVwap = ta.vwap(hlc3)
+intradayEma = ta.ema(close, intradayEmaLen)
+atrValue = ta.atr(atrLen)
+rangeAtr = atrValue > 0 ? (high - low) / atrValue : 0.0
+
+[dClose, dEma9, dEma21, dEma50] = request.security(
+    syminfo.tickerid,
+    dailyTf,
+    [close, ta.ema(close, 9), ta.ema(close, 21), ta.ema(close, 50)],
+    gaps=barmerge.gaps_off,
+    lookahead=barmerge.lookahead_off
+)
+
+[hClose, hHigh, hLowPrev, hEma21, hEma21Prev] = request.security(
+    syminfo.tickerid,
+    hourlyTf,
+    [close, high, low[1], ta.ema(close, 21), ta.ema(close, 21)[1]],
+    gaps=barmerge.gaps_off,
+    lookahead=barmerge.lookahead_off
+)
+
+dailyShortValid = dEma9 < dEma21 and dEma21 < dEma50 and dClose < dEma9
+hourlyShortValid = hClose < hEma21 and hEma21 <= hEma21Prev and hHigh <= hHigh[1]
+vwapWeak = close < sessionVwap
+intradayEmaWeak = close < intradayEma
+barWeak = not requireRedBar or close < open
+rangeValid = rangeAtr >= minRangeAtr
+prevHourLowValid = not na(hLowPrev)
+prevHourLowBreak = prevHourLowValid and ta.crossunder(close, hLowPrev)
+
+allGates = (
+    (not useDailyShortGate or dailyShortValid) and
+    (not useHourlyShortGate or hourlyShortValid) and
+    (not useVwapGate or vwapWeak) and
+    (not useIntradayEmaGate or intradayEmaWeak) and
+    barWeak and
+    rangeValid
+)
+
+shortPrevHourLowBreak = prevHourLowBreak and allGates
+freshShortPrevHourLowBreak = shortPrevHourLowBreak and not shortPrevHourLowBreak[1]
+
+plot(showLevels and prevHourLowValid ? hLowPrev : na, "Prior Hour Low", color=color.new(color.red, 0), linewidth=2, style=plot.style_linebr)
+plot(intradayEma, "Intraday EMA", color=color.orange, linewidth=2)
+plot(useVwapGate ? sessionVwap : na, "Session VWAP", color=color.aqua, linewidth=2)
+
+bgcolor(showBackground and shortPrevHourLowBreak ? color.new(color.red, 86) : na)
+plotshape(
+    freshShortPrevHourLowBreak,
+    title="ML_SHORT_PREV_HOUR_LOW_BREAK",
+    style=shape.labeldown,
+    location=location.abovebar,
+    color=color.new(color.red, 0),
+    textcolor=color.white,
+    text="SHORT C1",
+    size=size.tiny,
+    display=showMarkers ? display.all : display.none
+)
+
+alertcondition(
+    freshShortPrevHourLowBreak,
+    title="ML_SHORT_PREV_HOUR_LOW_BREAK",
+    message="ML_SHORT_PREV_HOUR_LOW_BREAK"
+)

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
 
-@dataclass(slots=True)
+@dataclass(**({"slots": True} if sys.version_info >= (3, 10) else {}))
 class PartialTakeProfitConfig:
     # Each item: (r_multiple, pct_of_position_to_sell)
     # e.g. [(3.0, 40.0), (5.0, 30.0)] means:

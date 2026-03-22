@@ -176,6 +176,8 @@ class EpsSetupDetector:
                 continue
 
             days_since = len(df) - 1 - gap_idx
+            if days_since < cfg.min_days_since_gap:
+                continue
             if days_since > cfg.max_days_since_gap:
                 continue
 
@@ -199,32 +201,38 @@ class EpsSetupDetector:
             if cs < cfg.min_close_strength:
                 continue
 
-            # Gap integrity: current price above gap day low
-            gap_day_low   = float(gap_bar["low"])
+            # A gap is considered filled only once price loses the prior close,
+            # not merely the gap-day low. This keeps recent EPS gaps actionable
+            # after the initial shakeout while still rejecting fully failed gaps.
             current_price = float(last_bar["close"])
-            gap_intact    = current_price > gap_day_low
+            gap_fill_level = close_prev * (1 - cfg.gap_fill_buffer_pct / 100.0)
+            gap_intact = current_price > gap_fill_level
 
             if cfg.gap_fill_invalidates and not gap_intact:
                 continue
 
             # EMA9
             ema9 = self._compute_ema9(df)
-            ema9_current = float(ema9.iloc[-1])
+            ema9_current = float(ema9.iloc[-1]) if not pd.isna(ema9.iloc[-1]) else current_price
 
-            # Entry: current price if near EMA9, else EMA9 itself
-            pullback_from_high = (float(df["high"].iloc[gap_idx:].max()) - current_price)
-            pullback_pct       = pullback_from_high / current_price * 100
+            gap_day_low = float(gap_bar["low"])
+            gap_day_close = float(gap_bar["close"])
+            gap_day_high = float(gap_bar["high"])
+            pullback_pct = ((gap_day_high - current_price) / gap_day_high * 100) if gap_day_high > 0 else 0.0
 
-            if current_price >= ema9_current and pullback_pct <= cfg.max_pullback_pct:
-                entry       = current_price
+            if days_since <= 1:
+                entry = max(current_price, gap_day_close)
+                setup_stage = "fresh"
+            elif current_price >= ema9_current and pullback_pct <= cfg.max_pullback_pct:
+                entry = current_price
                 setup_stage = "pullback" if pullback_pct > 1.0 else "fresh"
-            elif current_price < ema9_current:
-                continue   # below EMA9 = setup extended
-            else:
-                entry       = current_price
+            elif gap_intact:
+                entry = max(gap_day_close, ema9_current, current_price)
                 setup_stage = "consolidating"
+            else:
+                continue
 
-            stop          = gap_day_low
+            stop = gap_day_low
             tight_stop    = float(df["low"].iloc[-1])
             risk_per_share = entry - stop
             if risk_per_share <= 0:

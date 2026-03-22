@@ -140,7 +140,7 @@ class WeeklyReviewer:
             log.warning("trades.csv not found: %s", self.trades_csv)
             return []
         records: list[TradeRecord] = []
-        with open(self.trades_csv, newline="") as f:
+        with open(self.trades_csv, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
@@ -187,7 +187,7 @@ class WeeklyReviewer:
         for t in trades:
             risk_per_share = abs(t.entry_price - t.stop_price)
             # Mistake 1: Sold at breakeven when stock had potential
-            if -0.1 < t.r_realized < 0.1 and t.exit_reason in ("manual", "breakeven"):
+            if -0.1 <= t.r_realized <= 0.1 and t.exit_reason in ("manual", "breakeven"):
                 if t.score >= 0.7:
                     mistakes.append(
                         f"{t.symbol} ({t.date}): BE exit on high-score setup ({t.score:.2f}) — "
@@ -372,7 +372,7 @@ class WeeklyReviewer:
     def save_report(self, report: WeeklyReport, output_dir: str = "reports") -> str:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         fname = f"{output_dir}/weekly_{report.week_end}.md"
-        with open(fname, "w") as f:
+        with open(fname, "w", encoding="utf-8") as f:
             f.write(report.markdown)
         log.info("Report saved: %s", fname)
         return fname

@@ -1,19 +1,19 @@
 """
-Dynamic Position Sizer — Martin Luk 4hr Video (40:38 - 48:22)
+Dynamic Position Sizer ??Martin Luk 4hr Video (40:38 - 48:22)
 
 Martin's exact rules:
   - Base risk per trade: 0.25% - 0.5% of equity
   - Position size = risk% / stop%
-  - Example: risk=0.5%, stop=1.5% → position=33% of equity
-  - Can hold multiple positions → total exposure up to 200-280%
+  - Example: risk=0.5%, stop=1.5% ??position=33% of equity
+  - Can hold multiple positions ??total exposure up to 200-280%
   - Small caps / micro caps: hard cap at 15-20% (gap risk)
   - When market is WEAK: reduce all sizes by exposure_factor from LeaderScanner
   - Never risk more than 1% on a single trade (hard rule)
 
 This module integrates with:
-  - LeaderScanner → exposure_factor
-  - RegimeDetector → regime_multiplier
-  - PullbackSignal / BreakoutSignal → stop_pct
+  - LeaderScanner ??exposure_factor
+  - RegimeDetector ??regime_multiplier
+  - PullbackSignal / BreakoutSignal ??stop_pct
 """
 
 from __future__ import annotations
@@ -31,11 +31,13 @@ class SizingResult:
     equity: float
     shares: int
     dollar_size: float
-    position_pct: float       # % of equity
+    position_pct: float       # fraction of equity, e.g. 0.25
     risk_dollars: float       # Actual $ at risk
-    risk_pct: float           # % of equity at risk
-    stop_pct: float           # Stop distance %
+    risk_pct: float           # fraction of equity at risk
+    stop_pct: float           # Stop distance fraction
     r_multiple_target: float
+    entry_price: float = 0.0
+    stop_price: float = 0.0
     notes: str = ""
 
     def __str__(self) -> str:
@@ -45,6 +47,37 @@ class SizingResult:
             f"Risk: ${self.risk_dollars:,.0f} ({self.risk_pct:.2%}) | "
             f"Stop: {self.stop_pct:.1%} | Target: {self.r_multiple_target}R"
         )
+
+    @property
+    def position_value(self) -> float:
+        return self.dollar_size
+
+    @property
+    def position_pct_of_equity(self) -> float:
+        return self.position_pct * 100.0
+
+    @property
+    def risk_per_trade(self) -> float:
+        return self.risk_dollars
+
+    @property
+    def risk_per_share(self) -> float:
+        return abs(self.entry_price - self.stop_price)
+
+    def to_dict(self) -> dict[str, float | str | int]:
+        return {
+            "symbol": self.symbol,
+            "shares": self.shares,
+            "position_value": round(self.position_value, 2),
+            "position_pct_of_equity": round(self.position_pct_of_equity, 3),
+            "risk_per_trade": round(self.risk_per_trade, 2),
+            "risk_per_share": round(self.risk_per_share, 4),
+            "entry_price": round(self.entry_price, 4),
+            "stop_price": round(self.stop_price, 4),
+            "risk_pct": round(self.risk_pct * 100.0, 3),
+            "stop_pct": round(self.stop_pct * 100.0, 3),
+            "notes": self.notes,
+        }
 
 
 @dataclass
@@ -78,6 +111,36 @@ class SizerConfig:
             }
 
 
+class PositionSizerConfig(SizerConfig):
+    """Backward-compatible config wrapper for older tests/callers."""
+
+    @staticmethod
+    def _pct(value: float) -> float:
+        return value / 100.0 if value > 1 else value
+
+    def __init__(
+        self,
+        per_trade_risk_pct: float = 0.5,
+        max_position_pct: float = 35.0,
+        max_position_small_cap_pct: float = 15.0,
+        small_cap_threshold_mcap: float = 2_000_000_000.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            base_risk_pct=kwargs.pop("base_risk_pct", self._pct(per_trade_risk_pct)),
+            max_risk_pct=kwargs.pop("max_risk_pct", 0.010),
+            min_risk_pct=kwargs.pop("min_risk_pct", 0.002),
+            max_position_pct=kwargs.pop("max_position_pct", self._pct(max_position_pct)),
+            max_small_cap_pct=kwargs.pop("max_small_cap_pct", self._pct(max_position_small_cap_pct)),
+            max_micro_cap_pct=kwargs.pop("max_micro_cap_pct", 0.10),
+            small_cap_threshold=kwargs.pop("small_cap_threshold", small_cap_threshold_mcap),
+            micro_cap_threshold=kwargs.pop("micro_cap_threshold", 5e8),
+            max_total_exposure=kwargs.pop("max_total_exposure", 2.50),
+            max_positions=kwargs.pop("max_positions", 8),
+            regime_multipliers=kwargs.pop("regime_multipliers", None),
+        )
+
+
 class PositionSizer:
     """
     Calculates dynamic position sizes for Martin Luk's swing trading system.
@@ -102,6 +165,7 @@ class PositionSizer:
         market_cap: Optional[float] = None,
         current_exposure: float = 0.0,   # Sum of all open position sizes / equity
         r_multiple_target: float = 2.5,
+        direction: str = "long",
     ) -> Optional[SizingResult]:
         """
         Calculate position size for a single trade.
@@ -111,12 +175,21 @@ class PositionSizer:
           - Risk would exceed hard caps
           - Portfolio is already at max exposure
         """
-        if entry_price <= 0 or stop_price <= 0 or stop_price >= entry_price:
-            logger.warning(f"{symbol}: invalid stop ({stop_price:.2f} >= entry {entry_price:.2f})")
+        direction_key = str(direction or "long").lower().strip()
+        if entry_price <= 0 or stop_price <= 0:
+            logger.warning(f"{symbol}: invalid price inputs entry={entry_price:.2f} stop={stop_price:.2f}")
             return None
+        if direction_key == "short":
+            if stop_price <= entry_price:
+                logger.warning(f"{symbol}: invalid short stop ({stop_price:.2f} <= entry {entry_price:.2f})")
+                return None
+        else:
+            if stop_price >= entry_price:
+                logger.warning(f"{symbol}: invalid stop ({stop_price:.2f} >= entry {entry_price:.2f})")
+                return None
 
-        stop_pct = (entry_price - stop_price) / entry_price
-        if stop_pct > 0.12:   # Stop wider than 12% → skip
+        stop_pct = abs(entry_price - stop_price) / entry_price
+        if stop_pct > 0.12:   # Stop wider than 12% ??skip
             logger.info(f"{symbol}: stop too wide ({stop_pct:.1%}), skipping")
             return None
 
@@ -127,7 +200,6 @@ class PositionSizer:
                                  min(adjusted_risk_pct, self.config.max_risk_pct))
 
         # ---- Position size from risk ----
-        # position_pct = risk_pct / stop_pct
         raw_position_pct = adjusted_risk_pct / stop_pct
 
         # ---- Apply caps ----
@@ -150,10 +222,12 @@ class PositionSizer:
 
         actual_dollar = shares * entry_price
         actual_pct = actual_dollar / equity
-        risk_dollars = shares * (entry_price - stop_price)
+        risk_dollars = shares * abs(entry_price - stop_price)
         risk_pct = risk_dollars / equity
 
         notes_parts = []
+        if direction_key == "short":
+            notes_parts.append("short_position")
         if regime_mult < 1.0:
             notes_parts.append(f"regime={regime}({regime_mult:.0%})")
         if exposure_factor < 1.0:
@@ -177,6 +251,8 @@ class PositionSizer:
             risk_pct=round(risk_pct, 4),
             stop_pct=round(stop_pct, 4),
             r_multiple_target=r_multiple_target,
+            entry_price=entry_price,
+            stop_price=stop_price,
             notes="; ".join(notes_parts),
         )
 
@@ -207,6 +283,7 @@ class PositionSizer:
                 exposure_factor=exposure_factor,
                 market_cap=c.get("market_cap"),
                 current_exposure=current_exposure,
+                direction=c.get("direction", "long"),
             )
             if result:
                 results.append(result)
@@ -248,3 +325,6 @@ class PositionSizer:
             "avg_stop_pct": round(avg_stop * 100, 1),
             "max_single_risk": round(max(r.risk_pct for r in results) * 100, 2),
         }
+
+
+PositionSizeResult = SizingResult

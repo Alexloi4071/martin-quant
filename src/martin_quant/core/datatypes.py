@@ -6,15 +6,19 @@ from typing import Any
 from martin_quant.core.enums import ReviewLabelType, SetupType, TriggerType
 
 
-@dataclass(slots=True)
+@dataclass
 class SetupSignal:
     symbol: str
-    timestamp: Any
     setup_type: SetupType
-    timeframe: str
+    timestamp: Any = None
+    timeframe: str = "1d"
 
     direction: str = "long"
     score: float = 0.0
+
+    entry_price: float | None = None
+    stop_price: float | None = None
+    target_price: float | None = None
 
     trigger_level: float | None = None
     invalidation_level: float | None = None
@@ -32,6 +36,9 @@ class SetupSignal:
             "timeframe": self.timeframe,
             "direction": self.direction,
             "score": self.score,
+            "entry_price": self.entry_price,
+            "stop_price": self.stop_price,
+            "target_price": self.target_price,
             "trigger_level": self.trigger_level,
             "invalidation_level": self.invalidation_level,
             "support_level": self.support_level,
@@ -41,7 +48,7 @@ class SetupSignal:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class TriggerSignal:
     symbol: str
     timestamp: Any
@@ -76,7 +83,7 @@ class TriggerSignal:
         }
 
 
-@dataclass(slots=True)
+@dataclass
 class ReviewLabel:
     symbol: str
     timestamp: Any
@@ -94,3 +101,4 @@ class ReviewLabel:
             "reviewer": self.reviewer,
             "metadata": self.metadata,
         }
+

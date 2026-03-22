@@ -1,6 +1,5 @@
-# config/research.yaml
+﻿# config/research.yaml
 # Martin Quant - full project config
-# Sections: project, data, providers, universe, setups, timing, risk, backtest, runtime
 
 project:
   name: martin-quant
@@ -17,10 +16,6 @@ data:
     - 1h
     - 15m
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PROVIDERS
-# Finviz = candidate generator only. Martin does all real strategy judgement.
-# ─────────────────────────────────────────────────────────────────────────────
 providers:
   finviz:
     enabled: true
@@ -29,11 +24,17 @@ providers:
     max_symbols_total: 150
     per_screen_cap: 40
 
-    # 4 screens with different roles:
-    # core_leaders    -> large/mid cap, confirmed trend, strong 6M perf
-    # growth_momentum -> EPS+sales growth, in uptrend
-    # pullback_candidates -> trend intact but near-term dip (potential entry zones)
-    # breakout_candidates -> high rel-vol, near 52w high, potential breakout
+    # 8 screens with different roles:
+    # long side
+    # core_leaders         -> large/mid cap, confirmed trend, strong 6M perf
+    # growth_momentum      -> EPS+sales growth, in uptrend
+    # pullback_candidates  -> trend intact but near-term dip
+    # breakout_candidates  -> high rel-vol, near 52w high
+    # short side
+    # failed_breakout_shorts     -> weak names already below key MAs
+    # bounce_into_resistance     -> downtrends with recent weak bounce
+    # broken_leaders             -> former leaders losing the 50d but not fully dead
+    # parabolic_short_candidates -> extended names for reversal-risk review only
     screens:
       - name: core_leaders
         enabled: true
@@ -90,9 +91,62 @@ providers:
           - ta_sma50_pa
           - ta_highlow52w_a10h
 
+      - name: failed_breakout_shorts
+        enabled: true
+        limit: 120
+        order: perfmonth
+        signal: top_losers
+        filters:
+          - geo_usa
+          - sh_price_o10
+          - cap_smallover
+          - sh_avgvol_o500
+          - ta_sma50_pb
+          - ta_sma200_pb
+
+      - name: bounce_into_resistance
+        enabled: true
+        limit: 120
+        order: -perfweek
+        signal: ""
+        filters:
+          - geo_usa
+          - sh_price_o10
+          - cap_smallover
+          - sh_avgvol_o500
+          - ta_sma50_pb
+          - ta_sma200_pb
+          - ta_perf_4wup
+
+      - name: broken_leaders
+        enabled: true
+        limit: 120
+        order: perfmonth
+        signal: ""
+        filters:
+          - geo_usa
+          - sh_price_o10
+          - cap_midover
+          - sh_avgvol_o500
+          - ta_sma50_pb
+          - ta_sma200_pa
+
+      - name: parabolic_short_candidates
+        enabled: true
+        limit: 120
+        order: -relativevolume
+        signal: top_gainers
+        filters:
+          - geo_usa
+          - sh_price_o10
+          - cap_smallover
+          - sh_avgvol_o500
+          - ta_sma50_pa
+          - ta_highlow52w_a10h
+
   finnhub:
     enabled: true
-    api_key: ""                    # leave blank; set FINNHUB_API_KEY in env
+    api_key: ""
     api_key_env: FINNHUB_API_KEY
     pause_seconds: 0.35
     timeout: 20
@@ -110,10 +164,6 @@ providers:
       hourly_days: 120
       m15_days: 45
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UNIVERSE BUILDER
-# Second-pass filter after Finviz candidate pool.
-# ─────────────────────────────────────────────────────────────────────────────
 universe:
   benchmark_symbol: SPY
   max_size: 30
@@ -143,9 +193,6 @@ universe:
       - robotics
       - energy_transition
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SETUPS
-# ─────────────────────────────────────────────────────────────────────────────
 setups:
   pullback:
     enabled: true
@@ -167,9 +214,6 @@ setups:
     tightness_atr_multiplier: 0.5
     min_close_above_breakout_pct: 0.0
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TIMING  (intraday triggers on 15m / 1h)
-# ─────────────────────────────────────────────────────────────────────────────
 timing:
   reclaim:
     enabled: true
@@ -197,9 +241,6 @@ timing:
     max_avwap_extension_pct: 3.0
     require_context_1h_ok: true
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RISK
-# ─────────────────────────────────────────────────────────────────────────────
 risk:
   position_sizing:
     per_trade_risk_pct: 0.5
@@ -214,15 +255,12 @@ risk:
 
   partial_take_profit:
     partial_levels:
-      - [3.0, 40.0]   # take 40% at +3R
-      - [5.0, 30.0]   # take 30% at +5R
+      - [3.0, 40.0]
+      - [5.0, 30.0]
 
   trailing_exit:
     trail_mode: ema9
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BACKTEST
-# ─────────────────────────────────────────────────────────────────────────────
 backtest:
   enabled: true
   max_holding_days: 20
@@ -234,9 +272,6 @@ backtest:
     test_months: 1
     step_months: 1
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RUNTIME
-# ─────────────────────────────────────────────────────────────────────────────
 runtime:
   account_equity: 100000
   output_dir: outputs/research_runs

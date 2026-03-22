@@ -10,7 +10,7 @@ from martin_quant.core.enums import SetupType, TriggerType
 from martin_quant.features.ema import compute_ema
 
 
-@dataclass(slots=True)
+@dataclass
 class OrbConfig:
     orb_minutes: int = 30
     max_entry_bars: int = 6
@@ -151,3 +151,4 @@ class OpeningRangeTrigger:
             if sig is not None:
                 results.append(sig)
         return sorted(results, key=lambda s: s.score, reverse=True)
+

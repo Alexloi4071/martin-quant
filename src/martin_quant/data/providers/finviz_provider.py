@@ -1,9 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import io
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 import pandas as pd
 
 
-@dataclass(slots=True)
+@dataclass
 class FinvizScreenDefinition:
     name: str
     filters: list[str]
@@ -20,7 +20,7 @@ class FinvizScreenDefinition:
     limit: int = 120
 
 
-@dataclass(slots=True)
+@dataclass
 class FinvizProviderConfig:
     base_url: str = "https://finviz.com/screener.ashx"
     view: str = "111"
@@ -46,6 +46,38 @@ class FinvizProvider:
 
     def __init__(self, config: FinvizProviderConfig | None = None) -> None:
         self.config = config or FinvizProviderConfig()
+
+    @staticmethod
+    def _filter_symbol_rows(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Keep only rows that look like real ticker symbols.
+
+        Finviz layout changes can cause pd.read_html() to parse filter controls,
+        nav rows, or menu headers instead of the screener results.
+        """
+        if "symbol" not in df.columns:
+            return pd.DataFrame(columns=["symbol"])
+
+        out = df.copy()
+        out["symbol"] = out["symbol"].astype(str).str.strip().str.upper()
+
+        invalid_symbols = {
+            "", "NAN", "TICKER", "SYMBOL", "NO.", "OVERVIEW", "VALUATION",
+            "FINANCIAL", "OWNERSHIP", "PERFORMANCE", "TECHNICAL", "ETF",
+            "NEWS", "SNAPSHOT", "MAPS", "STATS",
+        }
+        valid_mask = out["symbol"].str.fullmatch(r"[A-Z][A-Z\.\-]{0,9}", na=False)
+        valid_mask &= ~out["symbol"].isin(invalid_symbols)
+
+        if "company_name" in out.columns:
+            company = out["company_name"].astype(str).str.strip()
+            valid_mask &= company.ne("")
+            valid_mask &= ~company.str.contains("Overview|Valuation|Technical|Snapshot", case=False, na=False)
+
+        filtered = out.loc[valid_mask].drop_duplicates(subset=["symbol"]).reset_index(drop=True)
+        if filtered.empty:
+            return pd.DataFrame(columns=out.columns)
+        return filtered
 
     def _build_url(
         self,
@@ -133,13 +165,17 @@ class FinvizProvider:
             for table in tables:
                 cols = [str(c).strip().lower() for c in table.columns]
                 if "ticker" in cols or "company" in cols:
-                    return self._coerce_common_columns(self._snake_case_columns(table))
+                    cleaned = self._coerce_common_columns(self._snake_case_columns(table))
+                    cleaned = self._filter_symbol_rows(cleaned)
+                    if not cleaned.empty:
+                        return cleaned
         except Exception:
             pass
 
         tickers = sorted(set(re.findall(r"/quote\.ashx\?t=([A-Z\.\-]+)", html)))
         if not tickers:
             return pd.DataFrame(columns=["symbol"])
+        tickers = [ticker for ticker in tickers if ticker not in {"NAN", "TICKER", "SYMBOL"}]
         return pd.DataFrame({"symbol": tickers})
 
     def screen(self, definition: FinvizScreenDefinition) -> pd.DataFrame:
@@ -185,8 +221,8 @@ class FinvizProvider:
         dedupe: bool = True,
     ) -> pd.DataFrame:
         frames = []
-        for d in definitions:
-            df = self.screen(d)
+        for definition in definitions:
+            df = self.screen(definition)
             if not df.empty:
                 frames.append(df)
                 time.sleep(self.config.pause_seconds)
@@ -197,7 +233,7 @@ class FinvizProvider:
         out = pd.concat(frames, ignore_index=True)
 
         if dedupe and "symbol" in out.columns:
-            agg_cols = [c for c in out.columns if c != "screen_name"]
+            agg_cols = [col for col in out.columns if col != "screen_name"]
             out = (
                 out.sort_values(["symbol", "screen_name"])
                 .groupby("symbol", as_index=False)
